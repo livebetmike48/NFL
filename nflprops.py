@@ -9,11 +9,12 @@ Ported from Bot Cooks props.py (MLB) with the NFL-specific changes:
     "open" = first quote ever seen for (game, market, player, book) and
     "now" = the latest one. Queries scope to the active slate (games that
     haven't finished yet).
-  * Two-tier polling in ONE loop: ALERT markets (pass/rush/rec yards) every
-    NFL_POLL_MIN (default 5); everything else every NFL_TRACK_POLL_MIN
-    (default 30). Credits: 3 mkts x 16 games x 288 polls/day ~= 415K/mo
-    + 10 mkts x 16 games x 48 polls/day ~= 230K/mo. Flat 13 @ 5-min would
-    be ~1.8M/mo. The poll log prints real credit receipts every cycle.
+  * Schedule-aware two-tier polling in ONE loop (Mike's Sept 3 cadence):
+    Mon-Fri: every 60 min, ONLY between 10:00 and 24:00 ET (off overnight).
+    Sat-Sun: every 30 min, all 24 hours.
+    Track-only markets ride along once an hour. Credits for a 16-game week:
+    weekdays ~2.9K/day, weekend ~6.1K/day ~= 115K/mo. The poll log prints
+    real credit receipts every cycle.
   * Anytime TD is a Yes/No market (no line) -- stored with line=None,
     over=Yes price, under=No price, rendered as "Yes -145 / No +115".
   * Opener dedupe is (event_id, market, player) from day one -- once per
@@ -30,8 +31,13 @@ Commands (prefixed so they can't collide with Bot Cooks' /prop family):
 
 Env:
   NFL_PROPS_DB            -- sqlite path (VOLUME: /data/nflprops.db)
-  NFL_POLL_MIN            -- alert-market poll cadence, default 5
-  NFL_TRACK_POLL_MIN      -- track-only cadence, default 30
+  NFL_POLL_MIN            -- weekday (Mon-Fri) cadence, default 60
+  NFL_POLL_MIN_WEEKEND    -- Sat/Sun cadence (24h), default 30
+  NFL_WEEKDAY_HOURS       -- ET hours polling is ON Mon-Fri, default
+                             "10:00-24:00" (off overnight)
+  NFL_TRACK_POLL_MIN      -- track-only cadence, default 60 (time-based:
+                             piggybacks on whichever alert poll is due once
+                             this much time has passed)
   NFL_LOOKAHEAD_DAYS      -- hard cap on how far ahead to poll, default 14
                              (the real window is ONE NFL WEEK: first upcoming
                              kickoff + 7 days -- see _week_window)
@@ -61,8 +67,10 @@ log = logging.getLogger("nflprops")
 
 ET = ZoneInfo("America/New_York")
 ENABLED = os.getenv("NFL_PROPS", "1") not in ("0", "false", "off")
-POLL_MIN = max(1, int(os.getenv("NFL_POLL_MIN", "5") or 5))
-TRACK_POLL_MIN = max(POLL_MIN, int(os.getenv("NFL_TRACK_POLL_MIN", "30") or 30))
+POLL_MIN = max(1, int(os.getenv("NFL_POLL_MIN", "60") or 60))
+POLL_MIN_WEEKEND = max(1, int(os.getenv("NFL_POLL_MIN_WEEKEND", "30") or 30))
+TRACK_POLL_MIN = max(1, int(os.getenv("NFL_TRACK_POLL_MIN", "60") or 60))
+WEEKDAY_HOURS = os.getenv("NFL_WEEKDAY_HOURS", "10:00-24:00")
 LOOKAHEAD_DAYS = max(1, int(os.getenv("NFL_LOOKAHEAD_DAYS", "14") or 14))
 # Opener->close history is the PRODUCT -- it must live on the volume.
 DB = os.getenv("NFL_PROPS_DB") or (
@@ -119,6 +127,46 @@ OPENER_CHANNEL_BY_MARKET = {
     "player_rush_yds":      _cid("NFL_OPENERS_RUSH_ID") or OPENERS_CHANNEL_ID,
     "player_reception_yds": _cid("NFL_OPENERS_REC_ID") or OPENERS_CHANNEL_ID,
 }
+
+
+# ------------------------------------------------------------------ cadence
+
+def _parse_hours(spec: str) -> tuple[int, int]:
+    """'10:00-24:00' -> (600, 1440) minutes-of-day."""
+    a, b = spec.split("-")
+    def m(p):
+        h, mm = p.strip().split(":")
+        return int(h) * 60 + int(mm)
+    return m(a), m(b)
+
+
+try:
+    WD_ON, WD_OFF = _parse_hours(WEEKDAY_HOURS)
+except Exception:
+    log.error("NFL_WEEKDAY_HOURS %r unparseable — using 10:00-24:00", WEEKDAY_HOURS)
+    WD_ON, WD_OFF = 600, 1440
+
+
+def cadence_min(now: int | None = None) -> int:
+    """Minutes until the next poll, or 0 = polling is OFF right now.
+    Sat/Sun: POLL_MIN_WEEKEND around the clock.
+    Mon-Fri: POLL_MIN inside WEEKDAY_HOURS ET, off otherwise."""
+    dt = datetime.fromtimestamp(now or time.time(), ET)
+    if dt.weekday() >= 5:
+        return POLL_MIN_WEEKEND
+    mod = dt.hour * 60 + dt.minute
+    return POLL_MIN if WD_ON <= mod < WD_OFF else 0
+
+
+def seconds_until_on(now: int | None = None) -> int:
+    """When cadence is OFF: seconds until the next ON moment (weekday
+    WD_ON, or Saturday midnight ET if that comes first)."""
+    now = now or int(time.time())
+    for step in range(0, 48 * 60, 5):           # scan ahead in 5-min steps
+        t = now + step * 60
+        if cadence_min(t):
+            return max(0, t - now)
+    return 3600
 
 
 # ------------------------------------------------------------------ storage
@@ -401,21 +449,31 @@ async def poll_task(bot):
                          "NFL_PROPS_DB.", DB)
     except Exception:
         log.exception("nfl props db receipt failed")
-    log.info("NFL props tracker: alert markets every %dm, track-only every %dm, "
-             "window = one NFL week (cap %dd), books %s — openers feed %s",
-             POLL_MIN, TRACK_POLL_MIN, LOOKAHEAD_DAYS, ",".join(BOOKS),
+    log.info("NFL props tracker: Mon-Fri every %dm during %s ET, Sat-Sun every "
+             "%dm 24h, track-only every %dm, window = one NFL week (cap %dd), "
+             "books %s — openers feed %s",
+             POLL_MIN, WEEKDAY_HOURS, POLL_MIN_WEEKEND, TRACK_POLL_MIN, LOOKAHEAD_DAYS,
+             ",".join(BOOKS),
              (f"as '{OPENER_NAME}' -> " + ",".join(
                  f"{MARKETS[m]}:{c}" for m, c in OPENER_CHANNEL_BY_MARKET.items() if c))
              if any(OPENER_CHANNEL_BY_MARKET.values()) else "OFF (command-only)")
-    every = max(1, TRACK_POLL_MIN // POLL_MIN)
-    cycle = 0
+    last_track = 0.0
     while not bot.is_closed():
+        wait = cadence_min()
+        if not wait:
+            off = seconds_until_on()
+            log.info("nfl: polling off overnight — resumes in %dm", off // 60)
+            await asyncio.sleep(off + 5)
+            continue
+        now = time.time()
+        include_track = (now - last_track) >= TRACK_POLL_MIN * 60
         try:
-            await poll_once(bot, include_track=(cycle % every == 0))
+            await poll_once(bot, include_track=include_track)
+            if include_track:
+                last_track = now
         except Exception:
             log.exception("nfl props poll failed")
-        cycle += 1
-        await asyncio.sleep(POLL_MIN * 60)
+        await asyncio.sleep(wait * 60)
 
 
 # ------------------------------------------------------------------ queries
