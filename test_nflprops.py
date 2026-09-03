@@ -146,5 +146,25 @@ for c in d.tree.get_commands():
     for p in c.parameters:
         check(f"/{c.name} {p.name} desc <=100", len(p.description) <= 100)
 
+
+# 13. week window -- the live bug: Sept 3, Thu 9/10 + Fri 9/11 + Sun 9/13 + Mon 9/14 + Thu 9/17
+from datetime import datetime, timezone
+def T(s): return int(datetime.fromisoformat(s).replace(tzinfo=timezone.utc).timestamp())
+now = T("2026-09-03T03:28:00")
+ks = {"thu": T("2026-09-11T00:15:00"), "fri": T("2026-09-12T00:00:00"), "sun": T("2026-09-13T17:00:00"),
+      "mon": T("2026-09-15T00:15:00"), "thu2": T("2026-09-18T00:15:00")}
+lo, hi = P._week_window(list(ks.values()), now)
+inwin = {k for k, t in ks.items() if lo <= t < hi}
+check("Sept 3 window covers Thu/Fri/SUN/MON, excludes next Thu", inwin == {"thu","fri","sun","mon"}, str(inwin))
+# in-season Tuesday
+now2 = T("2026-09-15T14:00:00")
+ks2 = {"thu2": ks["thu2"], "sun2": T("2026-09-20T17:00:00"), "mon2": T("2026-09-22T00:15:00"), "thu3": T("2026-09-25T00:15:00")}
+lo, hi = P._week_window(list(ks2.values()), now2)
+check("in-season Tue: exactly next week's games", {k for k,t in ks2.items() if lo<=t<hi} == {"thu2","sun2","mon2"})
+# during MNF: game in progress still on the slate
+now3 = ks["mon"] + 3600
+lo, hi = P._week_window(list(ks.values()) + list(ks2.values()), now3)
+check("MNF in progress stays on slate", lo <= ks["mon"] < hi)
+check("no events -> falls back to cap", P._week_window([], now) == (now - P.GAME_WINDOW_SEC, now + P.LOOKAHEAD_DAYS*86400))
 print(f"\n{'ALL PASS' if not fails else 'FAILURES: ' + str(fails)}")
 sys.exit(1 if fails else 0)
