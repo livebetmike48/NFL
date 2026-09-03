@@ -32,7 +32,9 @@ Env:
   NFL_PROPS_DB            -- sqlite path (VOLUME: /data/nflprops.db)
   NFL_POLL_MIN            -- alert-market poll cadence, default 5
   NFL_TRACK_POLL_MIN      -- track-only cadence, default 30
-  NFL_LOOKAHEAD_DAYS      -- only poll games starting within N days, default 9
+  NFL_LOOKAHEAD_DAYS      -- hard cap on how far ahead to poll, default 14
+                             (the real window is ONE NFL WEEK: first upcoming
+                             kickoff + 7 days -- see _week_window)
   NFL_BOOKS               -- default fanduel,draftkings,betmgm,williamhill_us
   NFL_OPENERS_CHANNEL_ID  -- catch-all openers channel
   NFL_OPENERS_PASS_ID / NFL_OPENERS_RUSH_ID / NFL_OPENERS_REC_ID
@@ -61,7 +63,7 @@ ET = ZoneInfo("America/New_York")
 ENABLED = os.getenv("NFL_PROPS", "1") not in ("0", "false", "off")
 POLL_MIN = max(1, int(os.getenv("NFL_POLL_MIN", "5") or 5))
 TRACK_POLL_MIN = max(POLL_MIN, int(os.getenv("NFL_TRACK_POLL_MIN", "30") or 30))
-LOOKAHEAD_DAYS = max(1, int(os.getenv("NFL_LOOKAHEAD_DAYS", "9") or 9))
+LOOKAHEAD_DAYS = max(1, int(os.getenv("NFL_LOOKAHEAD_DAYS", "14") or 14))
 # Opener->close history is the PRODUCT -- it must live on the volume.
 DB = os.getenv("NFL_PROPS_DB") or (
     "/data/nflprops.db" if os.path.isdir("/data") else "nflprops.db")
@@ -155,13 +157,28 @@ def _events_map() -> dict[str, tuple[int, str, str]]:
             "WHERE commence_ts IS NOT NULL").fetchall()}
 
 
-def active_event_ids(now: int | None = None) -> set[str]:
-    """Games that haven't finished: kickoff within the lookahead window
-    and less than GAME_WINDOW_SEC ago. This is 'the slate' for queries."""
-    now = now or int(time.time())
+def _week_window(kickoffs, now: int) -> tuple[int, int]:
+    """(lo, hi) epoch bounds for 'the slate' = ONE NFL WEEK of games.
+    lo = now - GAME_WINDOW_SEC (games in progress still count).
+    hi = first upcoming kickoff + 7 days, capped at LOOKAHEAD_DAYS.
+    A fixed N-day lookahead breaks in the preseason gap (Sept 3 -> Sunday
+    Sept 13 is 10+ days, so a 9-day window polled only Thu/Fri) and in
+    season it would drag next week's empty games in. Anchoring on the
+    first upcoming game tracks exactly the games that have props up."""
     lo = now - GAME_WINDOW_SEC
-    hi = now + LOOKAHEAD_DAYS * 86400
-    return {e for e, (t, _, _) in _events_map().items() if lo <= t <= hi}
+    cap = now + LOOKAHEAD_DAYS * 86400
+    upcoming = [t for t in kickoffs if t and t >= lo]
+    if not upcoming:
+        return lo, cap
+    return lo, min(min(upcoming) + 7 * 86400, cap)
+
+
+def active_event_ids(now: int | None = None) -> set[str]:
+    """Games on the current slate: kickoff inside the week window."""
+    now = now or int(time.time())
+    evmap = _events_map()
+    lo, hi = _week_window([t for t, _, _ in evmap.values()], now)
+    return {e for e, (t, _, _) in evmap.items() if lo <= t < hi}
 
 
 def _tlabel(ts: int) -> str:
@@ -325,18 +342,17 @@ def _store_events(events: list) -> None:
         log.exception("nfl: commence_time store failed")
 
 
-def _in_window(ev: dict, now: int) -> bool:
-    cts = _iso_ts(ev.get("commence_time"))
-    return bool(cts) and (now - GAME_WINDOW_SEC) <= cts <= (now + LOOKAHEAD_DAYS * 86400)
-
-
 async def poll_once(bot=None, include_track: bool = False) -> int:
     """One poll. Alert markets always; track-only markets when asked.
     Returns snapshots written. Logs a credit receipt."""
     now = int(time.time())
     events = await asyncio.to_thread(nfl_odds.get_events)  # free
     _store_events(events)
-    events = [ev for ev in (events or []) if ev.get("id") and _in_window(ev, now)]
+    lo, hi = _week_window([_iso_ts(ev.get("commence_time"))
+                           for ev in (events or [])], now)
+    events = [ev for ev in (events or [])
+              if ev.get("id") and (_iso_ts(ev.get("commence_time")) or 0) >= lo
+              and (_iso_ts(ev.get("commence_time")) or 0) < hi]
     param = ALERT_PARAM + ("," + TRACK_PARAM if include_track else "")
     n_mk = len(param.split(","))
     wrote = 0
@@ -350,8 +366,9 @@ async def poll_once(bot=None, include_track: bool = False) -> int:
         wrote += w
         openings_all.extend(opens)
     used = nfl_odds.credits_spent() - before
-    log.info("nfl poll: %d game(s) x %d market(s) = ~%d credits, %d snapshots, "
-             "%d opener(s)%s", len(events), n_mk, used, wrote, len(openings_all),
+    log.info("nfl poll: %d game(s) thru %s x %d market(s) = ~%d credits, "
+             "%d snapshots, %d opener(s)%s", len(events), _tlabel(hi), n_mk,
+             used, wrote, len(openings_all),
              f", {nfl_odds.credits_remaining()} remaining"
              if nfl_odds.credits_remaining() else "")
     if openings_all and bot is not None:
@@ -385,7 +402,7 @@ async def poll_task(bot):
     except Exception:
         log.exception("nfl props db receipt failed")
     log.info("NFL props tracker: alert markets every %dm, track-only every %dm, "
-             "lookahead %dd, books %s — openers feed %s",
+             "window = one NFL week (cap %dd), books %s — openers feed %s",
              POLL_MIN, TRACK_POLL_MIN, LOOKAHEAD_DAYS, ",".join(BOOKS),
              (f"as '{OPENER_NAME}' -> " + ",".join(
                  f"{MARKETS[m]}:{c}" for m, c in OPENER_CHANNEL_BY_MARKET.items() if c))
