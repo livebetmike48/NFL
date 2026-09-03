@@ -103,7 +103,22 @@ check("embed footer names the game", "Miami Dolphins @ Buffalo Bills" in embs[0]
 check("routing: pass -> catch-all 111, rush -> 222", P.OPENER_CHANNEL_BY_MARKET["player_pass_yds"]==111 and P.OPENER_CHANNEL_BY_MARKET["player_rush_yds"]==222)
 
 # 9. two-tier cadence
-check("5/30 -> track every 6th cycle", max(1, P.TRACK_POLL_MIN // P.POLL_MIN) == 6)
+check("defaults 60 weekday / 30 weekend / 60 track", (P.POLL_MIN, P.POLL_MIN_WEEKEND, P.TRACK_POLL_MIN) == (60, 30, 60))
+from datetime import datetime as _dt
+def ET(s): return int(_dt.fromisoformat(s).replace(tzinfo=P.ET).timestamp())
+check("Wed 3pm ET -> 60m", P.cadence_min(ET("2026-09-09T15:00:00")) == 60)
+check("Wed 9:59am ET -> OFF", P.cadence_min(ET("2026-09-09T09:59:00")) == 0)
+check("Wed 10:00am ET -> 60m", P.cadence_min(ET("2026-09-09T10:00:00")) == 60)
+check("Thu 11:59pm ET -> 60m", P.cadence_min(ET("2026-09-10T23:59:00")) == 60)
+check("Fri 12:30am ET -> OFF", P.cadence_min(ET("2026-09-11T00:30:00")) == 0)
+check("Sat 3am ET -> 30m (weekend 24h)", P.cadence_min(ET("2026-09-12T03:00:00")) == 30)
+check("Sun 11pm ET -> 30m", P.cadence_min(ET("2026-09-13T23:00:00")) == 30)
+check("Mon 12:30am ET -> OFF", P.cadence_min(ET("2026-09-14T00:30:00")) == 0)
+check("Mon 8pm ET -> 60m", P.cadence_min(ET("2026-09-14T20:00:00")) == 60)
+check("off at Wed 2am -> resumes in 8h", P.seconds_until_on(ET("2026-09-09T02:00:00")) == 8*3600)
+check("off at Fri 11pm? no, ON", P.cadence_min(ET("2026-09-11T23:00:00")) == 60)
+check("off Fri 2am -> resumes 10am Fri (8h)", P.seconds_until_on(ET("2026-09-11T02:00:00")) == 8*3600)
+check("hours parse", P._parse_hours("10:00-24:00") == (600, 1440))
 check("alert param = 3 markets", P.ALERT_PARAM.count(",") == 2)
 check("track param = 10 markets", P.TRACK_PARAM.count(",") == 9)
 
