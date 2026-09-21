@@ -3,12 +3,12 @@ LBM NFL BOT -- entry point.
 
 Modules:
   nflprops  -- props tracker + openers webhook (Phase 1)
-  (Phase 2: nflverse stats -- snaps / defense / player stats / injuries)
+  nflstats  -- nflverse stats / usage / defense / injuries / depth / roster (Phase 2)
 
 Env:
   DISCORD_TOKEN  -- required
   ODDS_API_KEY   -- required (see nfl_odds.py)
-  see nflprops.py for the tracker vars
+  see nflprops.py / nfl_data.py for the tracker + data vars
 """
 import logging
 import os
@@ -17,6 +17,7 @@ import discord
 from dotenv import load_dotenv
 
 import nflprops
+import nflstats
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO,
@@ -36,6 +37,7 @@ class NFLBot(discord.Client):
 
     async def setup_hook(self):
         nflprops.setup(self)
+        nflstats.setup(self)
         cmds = await self.tree.sync()
         log.info("synced %d command(s): %s", len(cmds),
                  ", ".join(f"/{c.name}" for c in cmds))
@@ -44,6 +46,7 @@ class NFLBot(discord.Client):
         # Reconnect guard: on_ready fires again after a resume.
         log.info("Logged in as %s", self.user)
         nflprops.start(self)
+        nflstats.start(self)
 
 
 if __name__ == "__main__":
