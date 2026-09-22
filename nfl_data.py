@@ -151,6 +151,53 @@ def load(key: str, force: bool = False) -> pd.DataFrame:
     return df
 
 
+def load_season(kind: str, season: int, force: bool = False) -> pd.DataFrame:
+    """Any season's weekly player stats / snap counts (for the model and the
+    backtest, which need seasons the command layer doesn't). Same cache +
+    TTL rules as load(). kind = "stats" | "snaps"."""
+    rel = {"stats": f"stats_player/stats_player_week_{season}.csv",
+           "snaps": f"snap_counts/snap_counts_{season}.csv"}[kind]
+    key = f"{kind}:{season}"
+    now = time.time()
+    if not force and key in _mem and now - _mem[key][0] < TTL:
+        return _mem[key][1]
+    os.makedirs(DATA_DIR, exist_ok=True)
+    p = os.path.join(DATA_DIR, rel.replace("/", "__"))
+    # completed seasons never change -- keep them forever once on disk
+    fresh = os.path.exists(p) and (season < SEASON or (now - os.path.getmtime(p)) < TTL) and not force
+    if not fresh:
+        try:
+            r = requests.get(f"{RELEASES}/{rel}", timeout=TIMEOUT)
+            if r.status_code == 200 and r.content:
+                with open(p, "wb") as f:
+                    f.write(r.content)
+                log.info("nflverse: refreshed %s (%d KB)", rel, len(r.content) // 1024)
+        except Exception:
+            log.exception("nflverse download failed: %s", rel)
+    try:
+        df = pd.read_csv(p, low_memory=False) if os.path.exists(p) else pd.DataFrame()
+    except Exception:
+        log.exception("nflverse: parse failed for %s", p)
+        df = pd.DataFrame()
+    _mem[key] = (now, df)
+    return df
+
+
+def games_all() -> pd.DataFrame:
+    """games.csv for ALL seasons (load('games') keeps only this season)."""
+    key = "games:all"
+    now = time.time()
+    if key in _mem and now - _mem[key][0] < TTL:
+        return _mem[key][1]
+    load("games")                      # ensures the file is on disk / fresh
+    try:
+        df = pd.read_csv(_path("games"), low_memory=False)
+    except Exception:
+        df = pd.DataFrame()
+    _mem[key] = (now, df)
+    return df
+
+
 def file_age_min(key: str) -> int | None:
     p = _path(key)
     return int((time.time() - os.path.getmtime(p)) // 60) if os.path.exists(p) else None
