@@ -1,41 +1,37 @@
 """
-NFL PARLAY -- Phase 3 of the NFL bot. Bot Cooks architecture, NFL data.
+NFL PARLAY v2 -- Bot Cooks for football.
 
-    model (nflmodel)  x  lines (nflprops tracker DB, zero extra credits)
-        -> P(over)/P(under) per player-market from the empirical ratio table
-        -> quality bars (real thresholds, not a score)
-        -> one leg per TEAM (no same-game stacking), sorted by edge
-        -> leg count is the OUTPUT; "no parlay this week" when nothing clears
+Every ticket is built from REAL numbers and shows its work on the leg:
+projection arithmetic + the matchup. No "model %" on the embed. The bars
+below are what a leg has to clear; they're thresholds, not a score.
 
-Posts once a week on game day (NFL_PARLAY_POST_ET, default "Sun 11:45" --
-after the 1pm-slate inactives drop at ~11:30 ET, before kickoff) through a
-webhook displaying as "NFL Parlay", when NFL_PARLAY_CHANNEL_ID is set.
-Thursday/Friday games are already played by then and are not on the slate. Every leg is stored and graded against
-nflverse box scores the following Tuesday (/nflrecord = the public
-forward log).
+KINDS (one command, one choice):
+  general   any market, overs or unders, incl. anytime TD
+  pass / rush / rec / recs   one market
+  td        anytime TD legs only (Yes side)
+  alt       alternate lines at plus money ("80+ yards at +200"), min/max odds
+  reverse   same player UNDER receptions + OVER rec yds -- big-play profile
+            (high aDOT / yards per catch) vs a defense that gives up chunks
+  sgp       one game (or the primetime games): any market, no team cap
 
-Quality bars (env-tunable, defaults):
-  NFL_BAR_P      0.60   model probability on the chosen side
-  NFL_BAR_EDGE   0.05   model P minus the implied P of the best price
-  NFL_MIN_PRICE  -150   never lay more than this
-  NFL_MAX_LEGS   6      cap (min is 2; fewer = no parlay)
-  NFL_MIN_GAMES  2      this-season games behind the volume blend
+BOOKS: every ticket is placeable on ONE book, FanDuel or DraftKings; the
+bot builds both and posts the stronger one, with a betslip link per leg
+(Odds API deep links, includeLinks=true).
 
-Injury gate: Out / Doubtful on the latest official report are excluded;
-Questionable stays in but is flagged on the leg.
+LINES: fetched on demand for the slate -- 9 markets x ~16 games ~= 144
+credits per build; cached 15 min so the four Sunday tickets share one fetch.
 
-Commands:
-  /nflparlay [post]      build this week's slate now (dry run unless post)
-  /nflrecord             forward log: every posted leg, graded, units
-  /nflbacktest [season]  grade the model on a past season with REAL closing
-                         lines from the Odds API historical endpoint
-                         (~8.5K credits for a season). Posts receipts:
-                         calibration table, Brier vs market, units at the
-                         bar, parlay record. Progress edits as it runs.
+SCHEDULE (ET):
+  NFL_PARLAY_POST_ET     default "Sun 11:45"  -> general, rush, rec, td
+  NFL_PRIMETIME_POST_ET  default "19:45"      -> sgp on any game kicking
+                                                 off 7pm-midnight that day
+                                                 (Thu / Sun / Mon)
+  NFL_RECAP_POST_ET      default "Tue 10:00"  -> graded recap of last week
+Posting needs NFL_PARLAY_CHANNEL_ID; otherwise everything is command-only.
 
-Ratio table: fit at boot from (SEASON-1) projections with (SEASON-2) as
-prior -- i.e. 2024 with a 2023 prior for a 2026 bot -- and cached on the
-volume. It is never fit on the season it grades.
+Every posted leg is stored and graded against nflverse box scores.
+/nflrecord [kind] = forward log by kind. /nflparlay kind [game] [post]
+[min_odds] [max_odds] = build now (dry run unless post).
 """
 from __future__ import annotations
 
@@ -46,7 +42,7 @@ import os
 import re
 import sqlite3
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import discord
@@ -62,53 +58,72 @@ log = logging.getLogger("nflparlay")
 ET = ZoneInfo("America/New_York")
 
 SEASON = nfl_data.SEASON
-BAR_P = float(os.getenv("NFL_BAR_P", "0.60"))
-BAR_EDGE = float(os.getenv("NFL_BAR_EDGE", "0.05"))
-MIN_PRICE = int(os.getenv("NFL_MIN_PRICE", "-150"))
-MAX_LEGS = max(2, int(os.getenv("NFL_MAX_LEGS", "6")))
-MIN_GAMES = int(os.getenv("NFL_MIN_GAMES", "2"))
-# floor on the posted line -- keeps 1.5-yard novelty props out of the slate
-MIN_LINE = {"pass": 150.0, "rush": 20.0, "rec": 15.0}
-# Disagreement gate: when the line sits this far from the projection the
-# market is pricing something the usage data can't see yet (a teammate's
-# injury, a promotion). That is missing information, not an edge -> skip.
-MAX_DISAGREE = float(os.getenv("NFL_MAX_DISAGREE", "0.35"))
-POST_ET = os.getenv("NFL_PARLAY_POST_ET", "Sun 11:45")   # "<Day> HH:MM" ET
 CHANNEL_ID = int(os.getenv("NFL_PARLAY_CHANNEL_ID", "0") or 0)
+POST_ET = os.getenv("NFL_PARLAY_POST_ET", "Sun 11:45")
+PRIME_ET = os.getenv("NFL_PRIMETIME_POST_ET", "19:45")
+RECAP_ET = os.getenv("NFL_RECAP_POST_ET", "Tue 10:00")
 WEBHOOK_NAME = "LBM NFL Parlay"
 DISPLAY_NAME = os.getenv("NFL_PARLAY_NAME", "NFL Parlay")
-DB = nflprops.DB                      # same volume DB as the tracker
-RATIO_PATH = os.path.join(nfl_data.DATA_DIR, f"ratio_table_{SEASON - 1}.json")
+BOOKS = ["fanduel", "draftkings"]
+BOOK_NAMES = {"fanduel": "FanDuel", "draftkings": "DraftKings"}
+DB = nflprops.DB
+RATIO_PATH = os.path.join(nfl_data.DATA_DIR, f"ratio_table_{SEASON - 1}_v2.json")
+FETCH_TTL = 15 * 60
+MIN_GAMES = int(os.getenv("NFL_MIN_GAMES", "2"))
+MAX_DISAGREE = float(os.getenv("NFL_MAX_DISAGREE", "0.35"))
+MIN_LINE = {"pass": 150.0, "rush": 20.0, "rec": 15.0, "recs": 1.5}
 
-_ratio: M.RatioTable | None = None
-
+# ------------------------------------------------------------------ bars
+# kind -> dict(markets, sides, p, edge, min_price, max_price, max_legs,
+#              min_legs, per_team, alt_only)
+KINDS = {
+    "general": dict(markets=["pass", "rush", "rec", "recs", "td"], sides=["over", "under", "yes"],
+                    p=0.60, edge=0.05, min_price=-150, max_price=400, max_legs=6, min_legs=2, per_team=1),
+    "pass":    dict(markets=["pass"], sides=["over", "under"], p=0.60, edge=0.05, min_price=-150,
+                    max_price=400, max_legs=5, min_legs=2, per_team=1),
+    "rush":    dict(markets=["rush"], sides=["over", "under"], p=0.60, edge=0.05, min_price=-150,
+                    max_price=400, max_legs=5, min_legs=2, per_team=1),
+    "rec":     dict(markets=["rec"], sides=["over", "under"], p=0.60, edge=0.05, min_price=-150,
+                    max_price=400, max_legs=5, min_legs=2, per_team=1),
+    "recs":    dict(markets=["recs"], sides=["over", "under"], p=0.60, edge=0.05, min_price=-150,
+                    max_price=400, max_legs=5, min_legs=2, per_team=1),
+    "td":      dict(markets=["td"], sides=["yes"], p=0.40, edge=0.05, min_price=-140,
+                    max_price=400, max_legs=5, min_legs=2, per_team=1),
+    "alt":     dict(markets=["pass", "rush", "rec"], sides=["over"], p=0.35, edge=0.05, min_price=150,
+                    max_price=400, max_legs=4, min_legs=2, per_team=1, alt_only=True),
+    "sgp":     dict(markets=["pass", "rush", "rec", "recs", "td"], sides=["over", "under", "yes"],
+                    p=0.58, edge=0.04, min_price=-150, max_price=400, max_legs=5, min_legs=2, per_team=99),
+}
+KIND_LABEL = {"general": "Parlay", "pass": "Passing Yards Parlay", "rush": "Rushing Yards Parlay",
+              "rec": "Receiving Yards Parlay", "recs": "Receptions Parlay", "td": "Anytime TD Parlay",
+              "alt": "Alt-Line Parlay", "reverse": "Big-Play Parlay", "sgp": "Same Game Parlay"}
+# reverse (same-player pairs) has its own bars
+REVERSE = dict(p=0.50, edge=0.02, min_price=-150, max_pairs=3, adot=11.0, ypr=13.0, min_rec=5)
 
 # ------------------------------------------------------------------ storage
 
 def _conn():
     c = sqlite3.connect(DB)
     c.execute("""CREATE TABLE IF NOT EXISTS nfl_parlay_legs (
-        season INTEGER, week INTEGER, posted_ts INTEGER, player_id TEXT,
-        player TEXT, team TEXT, market TEXT, side TEXT, line REAL,
+        season INTEGER, week INTEGER, kind TEXT, ticket TEXT, posted_ts INTEGER,
+        player_id TEXT, player TEXT, team TEXT, market TEXT, side TEXT, line REAL,
         price INTEGER, book TEXT, proj REAL, p REAL, edge REAL,
         actual REAL, result TEXT,
-        PRIMARY KEY (season, week, player_id, market))""")
+        PRIMARY KEY (season, ticket, player_id, market, side, line))""")
     return c
 
 
-# ------------------------------------------------------------------ names
+# ------------------------------------------------------------------ names / teams
 
 _SUFFIX = re.compile(r"\b(jr|sr|ii|iii|iv|v)\b\.?")
 
 
 def norm_name(s: str) -> str:
     s = (s or "").lower().replace(".", "").replace("'", "").replace("-", " ")
-    s = _SUFFIX.sub("", s)
-    return " ".join(s.split())
+    return " ".join(_SUFFIX.sub("", s).split())
 
 
-def _team_from_full(full: str) -> str | None:
-    """'Kansas City Chiefs' -> 'KC' via the nickname table."""
+def team_from_full(full: str) -> str | None:
     f = (full or "").lower()
     for ab, nick in nfl_data.TEAMS.items():
         if nick.lower() in f:
@@ -118,19 +133,7 @@ def _team_from_full(full: str) -> str | None:
 
 # ------------------------------------------------------------------ ratio table
 
-def _fit_ratio_table(progress=None) -> M.RatioTable:
-    fit_season, prior_season = SEASON - 1, SEASON - 2
-    cur = nfl_data.load_season("stats", fit_season)
-    pri = nfl_data.load_season("stats", prior_season)
-    games = nfl_data.games_all()
-    rt = M.RatioTable().fit(cur, pri, games, fit_season, progress=progress,
-                            snaps=nfl_data.load_season("snaps", fit_season))
-    try:
-        with open(RATIO_PATH, "w") as f:
-            json.dump(rt.to_dict(), f)
-    except Exception:
-        log.exception("ratio table cache write failed")
-    return rt
+_ratio: M.RatioTable | None = None
 
 
 def ratio_table() -> M.RatioTable:
@@ -146,53 +149,100 @@ def ratio_table() -> M.RatioTable:
         except Exception:
             log.exception("ratio table cache read failed — refitting")
     t0 = time.time()
-    _ratio = _fit_ratio_table()
-    log.info("nflparlay: ratio table fit on %d (prior %d) in %.0fs\n%s",
-             SEASON - 1, SEASON - 2, time.time() - t0, _ratio.summary())
+    fit, pri = SEASON - 1, SEASON - 2
+    _ratio = M.RatioTable().fit(nfl_data.load_season("stats", fit), nfl_data.load_season("stats", pri),
+                                nfl_data.games_all(), fit, snaps=nfl_data.load_season("snaps", fit))
+    try:
+        with open(RATIO_PATH, "w") as f:
+            json.dump(_ratio.to_dict(), f)
+    except Exception:
+        log.exception("ratio table cache write failed")
+    log.info("nflparlay: ratio table fit on %d (prior %d) in %.0fs\n%s", fit, pri, time.time() - t0,
+             _ratio.summary())
     return _ratio
 
 
-# ------------------------------------------------------------------ lines
+# ------------------------------------------------------------------ slate + quotes
 
 def current_week() -> int:
-    """The week whose lines are up = first REG week with an unplayed game."""
     g = nfl_data.load("games")
     g = g[g["game_type"] == "REG"]
     open_ = g[g["result"].isna()]
     return int(open_["week"].min()) if not open_.empty else int(g["week"].max())
 
 
-def tracker_lines(now: int | None = None) -> dict[tuple[str, str], dict]:
-    """Best available price per side from the tracker DB, pregame only.
-    -> {(norm_name, mkt): {"over": (line, price, book), "under": (...),
-                           "teams": {home, away}}}"""
-    out: dict[tuple[str, str], dict] = {}
-    evmap = nflprops._events_map()
-    for mk, odds_mk in M.ODDS_MARKET.items():
-        for mkt, player, book, _open, now_row, ev in nflprops.open_now(None, odds_mk, pregame_only=True, now=now):
-            ts, line, over, under = now_row
-            if line is None:
-                continue
-            key = (norm_name(player), mk)
-            e = out.setdefault(key, {"over": None, "under": None, "player": player,
-                                     "teams": set(), "event_id": ev})
-            evrow = evmap.get(ev)
-            if evrow:
-                e["teams"] = {_team_from_full(evrow[1]), _team_from_full(evrow[2])}
-            for side, price in (("over", over), ("under", under)):
-                if price is None:
-                    continue
-                # best price = highest American odds for the bettor
-                if e[side] is None or price > e[side][1]:
-                    e[side] = (float(line), int(price), book)
+def slate_events(now: int | None = None) -> list[dict]:
+    """Tracker events still to kick off this week: [{id, home, away, kick}]."""
+    now = now or int(time.time())
+    out = []
+    for ev, (kick, home, away) in nflprops._events_map().items():
+        if kick >= now and ev in nflprops.active_event_ids(now):
+            out.append({"id": ev, "home": team_from_full(home), "away": team_from_full(away),
+                        "kick": kick, "home_full": home, "away_full": away})
+    return sorted(out, key=lambda e: e["kick"])
+
+
+def primetime_events(now: int | None = None) -> list[dict]:
+    """Games kicking off 7pm-midnight ET today."""
+    now = now or int(time.time())
+    today = datetime.fromtimestamp(now, ET).date()
+    out = []
+    for e in slate_events(now):
+        k = datetime.fromtimestamp(e["kick"], ET)
+        if k.date() == today and k.hour >= 19:
+            out.append(e)
     return out
 
 
-# ------------------------------------------------------------------ legs
+_quote_cache: dict[str, tuple[float, list[dict]]] = {}
+FETCH_MARKETS = ",".join(list(M.ODDS_MARKET.values()) + list(M.ODDS_ALT.values()) + [M.ODDS_TD])
+
+
+def fetch_quotes(events: list[dict]) -> list[dict]:
+    """Every FD/DK quote on the alert+alt+TD markets for these events, with
+    deep links. -> [{event, teams, book, market(model key), alt, player,
+    line, side, price, link}]"""
+    out = []
+    alt_of = {v: k for k, v in M.ODDS_ALT.items()}
+    main_of = {v: k for k, v in M.ODDS_MARKET.items()}
+    for e in events:
+        c = _quote_cache.get(e["id"])
+        if c and time.time() - c[0] < FETCH_TTL:
+            out.extend(c[1]); continue
+        data = nfl_odds.get_event_props(e["id"], FETCH_MARKETS, ",".join(BOOKS), links=True)
+        rows = []
+        for bm in (data or {}).get("bookmakers", []):
+            bk = (bm.get("key") or "").lower()
+            if bk not in BOOKS:
+                continue
+            for mk in bm.get("markets", []):
+                key = mk.get("key")
+                if key == M.ODDS_TD:
+                    model_mk, alt = "td", False
+                elif key in main_of:
+                    model_mk, alt = main_of[key], False
+                elif key in alt_of:
+                    model_mk, alt = alt_of[key], True
+                else:
+                    continue
+                for oc in mk.get("outcomes", []):
+                    player = oc.get("description") or ""
+                    side = (oc.get("name") or "").lower()
+                    if not player or side not in ("over", "under", "yes"):
+                        continue
+                    rows.append({"event": e["id"], "teams": {e["home"], e["away"]},
+                                 "game": f"{e['away']} @ {e['home']}", "kick": e["kick"],
+                                 "book": bk, "market": model_mk, "alt": alt, "player": player,
+                                 "line": oc.get("point"), "side": side, "price": oc.get("price"),
+                                 "link": oc.get("link") or mk.get("link") or bm.get("link")})
+        _quote_cache[e["id"]] = (time.time(), rows)
+        out.extend(rows)
+    return out
+
+
+# ------------------------------------------------------------------ candidates
 
 def injury_gate(week: int) -> dict[str, str]:
-    """norm_name -> 'Out' | 'Doubtful' | 'Questionable' from the latest
-    official report for `week` (or the latest week on file)."""
     inj = nfl_data.load("injuries")
     if inj.empty:
         return {}
@@ -200,74 +250,139 @@ def injury_gate(week: int) -> dict[str, str]:
     wk = inj[inj["week"] == week]
     if wk.empty:
         wk = inj[inj["week"] == inj["week"].max()]
-    out = {}
-    for _, r in wk.iterrows():
-        st = str(r.get("report_status") or "")
-        if st in ("Out", "Doubtful", "Questionable"):
-            out[norm_name(r["full_name"])] = st
+    return {norm_name(r["full_name"]): str(r["report_status"]) for _, r in wk.iterrows()
+            if str(r.get("report_status") or "") in ("Out", "Doubtful", "Questionable")}
+
+
+def big_play_profile() -> dict[str, tuple[float, float]]:
+    """norm_name -> (aDOT, yards per reception) this season, min REVERSE['min_rec']."""
+    st = nfl_data.load_season("stats", SEASON)
+    st = st[st["season_type"] == "REG"]
+    g = st.groupby("player_display_name")[["targets", "receptions", "receiving_yards", "receiving_air_yards"]].sum()
+    g = g[g["receptions"] >= REVERSE["min_rec"]]
+    return {norm_name(n): (float(r["receiving_air_yards"] / r["targets"]) if r["targets"] else 0.0,
+                           float(r["receiving_yards"] / r["receptions"]))
+            for n, r in g.iterrows()}
+
+
+def candidates(week: int, events: list[dict]) -> list[dict]:
+    """Every quote joined to a projection -> leg candidate with p, edge."""
+    cur = nfl_data.load_season("stats", SEASON)
+    pri = nfl_data.load_season("stats", SEASON - 1)
+    projs = M.project(cur, pri, week, nfl_data.games_all(), SEASON, nfl_data.load_season("snaps", SEASON))
+    by_key = {(norm_name(p.name), p.market): p for p in projs}
+    rt = ratio_table()
+    inj = injury_gate(week)
+    out = []
+    for q in fetch_quotes(events):
+        pr = by_key.get((norm_name(q["player"]), q["market"]))
+        if pr is None or pr.team not in q["teams"] or q["price"] is None:
+            continue
+        if q["market"] == "td":
+            if q["side"] != "yes":
+                continue
+            p = M.p_anytime_td(pr.proj)
+            line = None
+        else:
+            if q["line"] is None:
+                continue
+            line = float(q["line"])
+            p_over = rt.p_over(pr.pos, pr.market, pr.proj, line)
+            if p_over is None:
+                continue
+            p = p_over if q["side"] == "over" else 1.0 - p_over
+        imp = M.implied(q["price"])
+        out.append({**q, "line": line, "player_id": pr.player_id, "name": pr.name, "team": pr.team,
+                    "pos": pr.pos, "proj": pr.proj, "why": pr.why(), "matchup": pr.matchup(),
+                    "p": p, "implied": imp, "edge": p - imp, "games_cur": pr.games_cur,
+                    "injury": inj.get(norm_name(pr.name))})
     return out
 
 
-def evaluate(projs: list[M.Projection], lines: dict, rt: M.RatioTable,
-             injuries: dict[str, str] | None = None) -> list[dict]:
-    """Every projection that has a line -> one candidate row with the model
-    P on both sides, the chosen side, and the edge at the best price.
-    Bars are NOT applied here (the backtest needs every row for calibration)."""
-    injuries = injuries or {}
-    rows = []
-    for pr in projs:
-        key = (norm_name(pr.name), pr.market)
-        ln = lines.get(key)
-        if not ln or not ln["over"] or not ln["under"]:
-            continue
-        if ln["teams"] and pr.team not in ln["teams"]:
-            continue          # name collision across games
-        line = ln["over"][0]
-        p_over = rt.p_over(pr.pos, pr.market, pr.proj, line)
-        if p_over is None:
-            continue
-        p_under = 1.0 - p_over
-        side = "over" if p_over >= p_under else "under"
-        p = max(p_over, p_under)
-        _, price, book = ln[side]
-        imp = M.implied(price)
-        rows.append({
-            "player_id": pr.player_id, "player": pr.name, "team": pr.team, "pos": pr.pos,
-            "market": pr.market, "opponent": pr.opponent, "proj": pr.proj, "why": pr.why(),
-            "line": line, "side": side, "p": p, "p_over": p_over, "price": price, "book": book,
-            "implied": imp, "edge": p - imp, "games_cur": pr.games_cur,
-            "injury": injuries.get(norm_name(pr.name)),
-            "market_p_over": _market_p_over(ln),
-        })
-    return rows
+def _passes(r: dict, k: dict, min_price: int | None, max_price: int | None) -> bool:
+    lo = min_price if min_price is not None else k["min_price"]
+    hi = max_price if max_price is not None else k["max_price"]
+    if r["market"] not in k["markets"] or r["side"] not in k["sides"]:
+        return False
+    if k.get("alt_only") and not r["alt"]:
+        return False
+    if not k.get("alt_only") and r["alt"]:
+        return False          # alt lines only on the alt ticket
+    if r["injury"] in ("Out", "Doubtful") or r["games_cur"] < MIN_GAMES:
+        return False
+    if r["market"] != "td":
+        if r["line"] < MIN_LINE[r["market"]]:
+            return False
+        if abs(r["line"] - r["proj"]) / max(r["line"], 1.0) > MAX_DISAGREE and not r["alt"]:
+            return False
+    return r["p"] >= k["p"] and r["edge"] >= k["edge"] and lo <= r["price"] <= hi
 
 
-def _market_p_over(ln: dict) -> float | None:
-    """De-vigged market P(over) from the best over/under prices."""
-    if not ln.get("over") or not ln.get("under"):
-        return None
-    io, iu = M.implied(ln["over"][1]), M.implied(ln["under"][1])
-    return io / (io + iu) if (io + iu) > 0 else None
-
-
-def pick_legs(rows: list[dict]) -> list[dict]:
-    """Apply the bars, one leg per team, best edge first, cap MAX_LEGS."""
-    ok = [r for r in rows
-          if r["p"] >= BAR_P and r["edge"] >= BAR_EDGE and r["price"] >= MIN_PRICE
-          and r["games_cur"] >= MIN_GAMES and r["injury"] not in ("Out", "Doubtful")
-          and r["line"] >= MIN_LINE[r["market"]]
-          and abs(r["line"] - r["proj"]) / max(r["line"], 1.0) <= MAX_DISAGREE]
+def build_ticket(kind: str, cands: list[dict], book: str, min_price=None, max_price=None,
+                 events: set[str] | None = None) -> list[dict]:
+    k = KINDS[kind]
+    ok = [r for r in cands if r["book"] == book and _passes(r, k, min_price, max_price)
+          and (events is None or r["event"] in events)]
     ok.sort(key=lambda r: -r["edge"])
-    legs, teams = [], set()
+    legs, teams, players = [], {}, set()
     for r in ok:
-        if r["team"] in teams:
+        if teams.get(r["team"], 0) >= k["per_team"] or r["player_id"] in players:
             continue
-        teams.add(r["team"])
+        teams[r["team"]] = teams.get(r["team"], 0) + 1
+        players.add(r["player_id"])
         legs.append(r)
-        if len(legs) >= MAX_LEGS:
+        if len(legs) >= k["max_legs"]:
             break
-    return legs
+    return legs if len(legs) >= k["min_legs"] else []
 
+
+def build_reverse(cands: list[dict], book: str) -> list[dict]:
+    """Pairs: same player UNDER receptions + OVER rec yds, big-play profile."""
+    prof = big_play_profile()
+    by_p: dict[str, dict] = {}
+    for r in cands:
+        if r["book"] != book or r["alt"] or r["injury"] in ("Out", "Doubtful"):
+            continue
+        if r["market"] == "recs" and r["side"] == "under":
+            by_p.setdefault(r["player_id"], {})["u"] = r
+        elif r["market"] == "rec" and r["side"] == "over":
+            by_p.setdefault(r["player_id"], {})["o"] = r
+    pairs = []
+    for pid, d in by_p.items():
+        if "u" not in d or "o" not in d:
+            continue
+        u, o = d["u"], d["o"]
+        adot, ypr = prof.get(norm_name(u["name"]), (0.0, 0.0))
+        if adot < REVERSE["adot"] and ypr < REVERSE["ypr"]:
+            continue
+        if min(u["p"], o["p"]) < REVERSE["p"] or min(u["edge"], o["edge"]) < REVERSE["edge"]:
+            continue
+        if min(u["price"], o["price"]) < REVERSE["min_price"]:
+            continue
+        u = {**u, "profile": f"aDOT {adot:.1f} • {ypr:.1f} yds/catch"}
+        pairs.append((u["edge"] + o["edge"], u, o))
+    pairs.sort(key=lambda x: -x[0])
+    legs = []
+    seen = set()
+    for _, u, o in pairs[:REVERSE["max_pairs"]]:
+        if u["team"] in seen:
+            continue
+        seen.add(u["team"])
+        legs += [u, o]
+    return legs if len(legs) >= 2 else []
+
+
+def best_book(kind: str, cands: list[dict], **kw) -> tuple[str | None, list[dict]]:
+    best = (None, [])
+    for bk in BOOKS:
+        legs = build_reverse(cands, bk) if kind == "reverse" else build_ticket(kind, cands, bk, **kw)
+        if len(legs) > len(best[1]) or (len(legs) == len(best[1]) and legs and
+                                        parlay_price(legs) > parlay_price(best[1])):
+            best = (bk, legs)
+    return best
+
+
+# ------------------------------------------------------------------ odds math
 
 def _dec(american: int) -> float:
     a = float(american)
@@ -275,6 +390,8 @@ def _dec(american: int) -> float:
 
 
 def parlay_price(legs: list[dict]) -> int:
+    if not legs:
+        return 0
     d = 1.0
     for r in legs:
         d *= _dec(r["price"])
@@ -285,146 +402,234 @@ def _fmt(p: int) -> str:
     return f"+{p}" if p > 0 else str(p)
 
 
-MK_LABEL = {"pass": "Pass Yds", "rush": "Rush Yds", "rec": "Rec Yds"}
+# ------------------------------------------------------------------ embed
+
+def _leg_line(r: dict) -> tuple[str, str]:
+    lbl = M.MK_LABEL[r["market"]]
+    if r["market"] == "td":
+        head = f"{r['name']} Anytime TD ({_fmt(r['price'])})"
+    else:
+        head = f"{r['name']} {r['side'].upper()} {r['line']:g} {lbl} ({_fmt(r['price'])})"
+    if r.get("injury") == "Questionable":
+        head += " ⚠️ Q"
+    body = f"{r['game']} • {r['why']}"
+    if r.get("matchup"):
+        body += f"\n{r['matchup']}"
+    if r.get("profile"):
+        body += f" • {r['profile']}"
+    if r.get("link"):
+        body += f" • [bet]({r['link']})"
+    return head, body
 
 
-def build_week(week: int | None = None) -> tuple[int, list[dict], list[dict]]:
-    """-> (week, all candidate rows, chosen legs) for the live slate."""
-    week = week or current_week()
-    cur = nfl_data.load_season("stats", SEASON)
-    pri = nfl_data.load_season("stats", SEASON - 1)
-    games = nfl_data.games_all()
-    projs = M.project(cur, pri, week, games, SEASON, nfl_data.load_season("snaps", SEASON))
-    rows = evaluate(projs, tracker_lines(), ratio_table(), injury_gate(week))
-    return week, rows, pick_legs(rows)
-
-
-def slate_embed(week: int, rows: list[dict], legs: list[dict], dry: bool) -> discord.Embed:
+def ticket_embed(kind: str, week: int, book: str | None, legs: list[dict], dry: bool,
+                 note: str = "") -> discord.Embed:
+    title_kind = KIND_LABEL[kind]
     if not legs:
-        e = discord.Embed(title=f"Week {week} — no parlay", color=0x95a5a6,
-                          description=(f"{len(rows)} player-markets had lines; none cleared the bars "
-                                       f"(P ≥ {BAR_P:.2f}, edge ≥ {BAR_EDGE:.2f}, price ≥ {MIN_PRICE}, "
-                                       f"line within {MAX_DISAGREE:.0%} of projection)."))
-        return e
-    e = discord.Embed(title=f"Week {week} NFL parlay — {len(legs)} legs ({_fmt(parlay_price(legs))})",
-                      color=0x2ecc71)
+        return discord.Embed(title=f"Week {week} {title_kind} — no ticket", color=0x95a5a6,
+                             description=f"Nothing cleared the bars{note}.")
+    e = discord.Embed(title=f"Week {week} {title_kind} — {len(legs)} legs {_fmt(parlay_price(legs))} "
+                            f"on {BOOK_NAMES[book]}", color=0x2ecc71)
     for r in legs:
-        flag = " ⚠️ Q" if r["injury"] == "Questionable" else ""
-        e.add_field(
-            name=f"{r['player']} {r['side'].upper()} {r['line']} {MK_LABEL[r['market']]} ({_fmt(r['price'])} {nflprops.BOOK_NAMES.get(r['book'], r['book'])}){flag}",
-            value=f"model {r['p']:.0%} vs implied {r['implied']:.0%} (+{r['edge']*100:.1f} pts) • {r['why']}",
-            inline=False)
-    gated = sum(1 for r in rows if abs(r["line"] - r["proj"]) / max(r["line"], 1.0) > MAX_DISAGREE)
-    e.set_footer(text=("DRY RUN • " if dry else "") + f"{len(rows)} candidates, {gated} skipped (line >{MAX_DISAGREE:.0%} "
-                 f"from projection = role change) • one leg per team • bars P≥{BAR_P:.2f} edge≥{BAR_EDGE:.2f} • "
-                 f"graded Tuesdays in /nflrecord")
+        h, b = _leg_line(r)
+        e.add_field(name=h[:256], value=b[:1024], inline=False)
+    foot = ("DRY RUN • " if dry else "") + f"all legs {BOOK_NAMES[book]} • price = straight product"
+    if kind in ("sgp", "reverse"):
+        foot += " (the book's SGP price will differ)"
+    if kind == "reverse":
+        foot += " • fewer catches + more yards = big-play profile; legs pull against each other"
+    e.set_footer(text=foot + " • graded Tuesdays • /nflrecord")
     return e
+
+
+# ------------------------------------------------------------------ build
+
+def build(kind: str, week: int | None = None, game: str | None = None, prime: bool = False,
+          min_price: int | None = None, max_price: int | None = None
+          ) -> tuple[int, str | None, list[dict], str]:
+    """-> (week, book, legs, note). game = team text to restrict to one game."""
+    week = week or current_week()
+    events = primetime_events() if prime else slate_events()
+    note = ""
+    if game:
+        t = nfl_data.resolve_team(game)
+        events = [e for e in events if t in (e["home"], e["away"])]
+        if not events:
+            return week, None, [], f" — no upcoming game for {game}"
+    if kind == "sgp" and not game and not prime:
+        events = events[:1] if events else []      # next kickoff
+    if not events:
+        return week, None, [], " — no games in the window"
+    cands = candidates(week, events)
+    ev_ids = {e["id"] for e in events}
+    book, legs = best_book(kind, cands, min_price=min_price, max_price=max_price, events=ev_ids) \
+        if kind != "reverse" else best_book(kind, cands)
+    if not legs:
+        note = f" — {len(cands)} priced legs looked at"
+    return week, book, legs, note
 
 
 # ------------------------------------------------------------------ record
 
-def store_legs(week: int, legs: list[dict]) -> None:
-    ts = int(time.time())
+def store(kind: str, week: int, book: str, legs: list[dict]) -> str:
+    ticket = f"{SEASON}-W{week}-{kind}-{int(time.time())}"
     with _conn() as c:
         for r in legs:
-            c.execute("INSERT OR REPLACE INTO nfl_parlay_legs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                      (SEASON, week, ts, r["player_id"], r["player"], r["team"], r["market"],
-                       r["side"], r["line"], r["price"], r["book"], r["proj"], r["p"], r["edge"],
+            c.execute("INSERT OR REPLACE INTO nfl_parlay_legs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                      (SEASON, week, kind, ticket, int(time.time()), r["player_id"], r["name"], r["team"],
+                       r["market"], r["side"], r["line"], r["price"], book, r["proj"], r["p"], r["edge"],
                        None, None))
+    return ticket
 
 
-def grade_legs() -> int:
-    """Fill actual/result for posted legs whose box scores are in. -> graded count."""
+def grade() -> int:
     cur = nfl_data.load_season("stats", SEASON, force=True)
     if cur.empty:
         return 0
     idx = cur[cur["season_type"] == "REG"].set_index(["player_id", "week"])
     n = 0
     with _conn() as c:
-        for wk, pid, mk, side, line in c.execute(
-                "SELECT week, player_id, market, side, line FROM nfl_parlay_legs "
-                "WHERE season=? AND result IS NULL", (SEASON,)).fetchall():
+        rows = c.execute("SELECT rowid, week, player_id, market, side, line FROM nfl_parlay_legs "
+                         "WHERE season=? AND result IS NULL", (SEASON,)).fetchall()
+        for rid, wk, pid, mk, side, line in rows:
             if (pid, wk) not in idx.index:
                 continue
             a = idx.loc[(pid, wk)]
             a = a.iloc[0] if isinstance(a, pd.DataFrame) else a
-            y = float(a[M.MARKETS[mk][1]])
-            res = "win" if (y > line if side == "over" else y < line) else "loss"
-            c.execute("UPDATE nfl_parlay_legs SET actual=?, result=? WHERE season=? AND week=? "
-                      "AND player_id=? AND market=?", (y, res, SEASON, wk, pid, mk))
+            if mk == "td":
+                y = float((a["rushing_tds"] or 0) + (a["receiving_tds"] or 0))
+                win = y >= 1
+            else:
+                y = float(a[M.MARKETS[mk][1]])
+                win = y > line if side == "over" else y < line
+            c.execute("UPDATE nfl_parlay_legs SET actual=?, result=? WHERE rowid=?",
+                      (y, "win" if win else "loss", rid))
             n += 1
     return n
 
 
-def record_text() -> str:
+def record_text(kind: str | None = None, week: int | None = None) -> str:
+    q = "SELECT week, kind, ticket, player, market, side, line, price, actual, result FROM nfl_parlay_legs WHERE season=?"
+    args: list = [SEASON]
+    if kind:
+        q += " AND kind=?"; args.append(kind)
+    if week:
+        q += " AND week=?"; args.append(week)
     with _conn() as c:
-        rows = c.execute("SELECT week, player, market, side, line, price, p, actual, result "
-                         "FROM nfl_parlay_legs WHERE season=? AND player_id != '__none__' "
-                         "ORDER BY week, player", (SEASON,)).fetchall()
+        rows = c.execute(q + " ORDER BY week, kind, ticket, player", args).fetchall()
     if not rows:
-        return "No legs posted yet this season."
-    units = 0.0
-    w = l = 0
-    by_week: dict[int, list] = {}
-    for wk, pl, mk, side, line, price, p, actual, res in rows:
-        by_week.setdefault(wk, []).append((pl, mk, side, line, price, p, actual, res))
-        if res == "win":
-            w += 1
-            units += _dec(price) - 1
-        elif res == "loss":
-            l += 1
-            units -= 1
-    out = [f"Legs {w}-{l} • {units:+.2f}u at 1u/leg (flat) • parlays: "]
-    pw = pl_ = 0
-    for wk, legs in by_week.items():
-        res = [x[7] for x in legs]
-        if all(r == "win" for r in res):
-            pw += 1
+        return "No legs posted yet."
+    tickets: dict[str, list] = {}
+    for r in rows:
+        tickets.setdefault(r[2], []).append(r)
+    by_kind: dict[str, dict] = {}
+    for tk, legs in tickets.items():
+        kd = legs[0][1]
+        s = by_kind.setdefault(kd, {"w": 0, "l": 0, "u": 0.0, "pw": 0, "pl": 0, "open": 0})
+        res = [x[9] for x in legs]
+        for wk_, kd_, t_, pl, mk, side, line, price, actual, r in legs:
+            if r == "win":
+                s["w"] += 1; s["u"] += _dec(price) - 1
+            elif r == "loss":
+                s["l"] += 1; s["u"] -= 1
+        if all(x == "win" for x in res):
+            s["pw"] += 1
         elif "loss" in res:
-            pl_ += 1
-    out[0] += f"{pw}-{pl_}"
-    for wk, legs in by_week.items():
-        out.append(f"\nWeek {wk}")
-        for pl, mk, side, line, price, p, actual, res in legs:
-            mark = {"win": "✅", "loss": "❌"}.get(res, "⏳")
+            s["pl"] += 1
+        else:
+            s["open"] += 1
+    out = ["kind        tickets   legs      units (1u/leg)"]
+    for kd, s in by_kind.items():
+        out.append(f"{KIND_LABEL[kd]:<24}{s['pw']}-{s['pl']}{' +' + str(s['open']) + ' open' if s['open'] else '':<10} "
+                   f"{s['w']}-{s['l']}   {s['u']:+.2f}u")
+    for tk, legs in tickets.items():
+        wk_, kd = legs[0][0], legs[0][1]
+        res = [x[9] for x in legs]
+        mark = "✅" if all(x == "win" for x in res) else "❌" if "loss" in res else "⏳"
+        out.append(f"\n{mark} Week {wk_} {KIND_LABEL[kd]}")
+        for _, _, _, pl, mk, side, line, price, actual, r in legs:
+            m = {"win": "✅", "loss": "❌"}.get(r, "⏳")
+            lbl = M.MK_LABEL[mk]
+            desc = f"{pl} Anytime TD" if mk == "td" else f"{pl} {side} {line:g} {lbl}"
             act = f" → {actual:.0f}" if actual is not None else ""
-            out.append(f"{mark} {pl} {side} {line} {MK_LABEL[mk]} ({_fmt(price)}) model {p:.0%}{act}")
+            out.append(f"  {m} {desc} ({_fmt(price)}){act}")
     return "\n".join(out)
 
 
 # ------------------------------------------------------------------ posting
 
-_wh_cache: dict[int, object] = {}
+_wh: dict[int, object] = {}
 
 
-async def _post(bot, embed: discord.Embed) -> bool:
+async def _post(bot, embed: discord.Embed | None = None, content: str | None = None) -> bool:
     ch = bot.get_channel(CHANNEL_ID)
     if not ch:
         log.warning("nflparlay: channel %d not found", CHANNEL_ID)
         return False
-    wh = _wh_cache.get(CHANNEL_ID)
+    wh = _wh.get(CHANNEL_ID)
     if wh is None:
         try:
             hooks = await ch.webhooks()
             wh = next((h for h in hooks if h.name == WEBHOOK_NAME), None) or await ch.create_webhook(name=WEBHOOK_NAME)
         except Exception:
             wh = False
-        _wh_cache[CHANNEL_ID] = wh
+        _wh[CHANNEL_ID] = wh
     try:
         if wh:
-            await wh.send(embed=embed, username=DISPLAY_NAME)
+            await wh.send(content=content, embed=embed, username=DISPLAY_NAME)
         else:
-            await ch.send(embed=embed)
+            await ch.send(content=content, embed=embed)
         return True
     except Exception:
         log.exception("nflparlay post failed")
         return False
 
 
-def _already_posted(week: int) -> bool:
+def _parse_day_time(spec: str, default=(6, 11, 45)) -> tuple[int, int, int]:
+    try:
+        d, hm = spec.split()
+        h, m = (int(x) for x in hm.split(":"))
+        return ["mon", "tue", "wed", "thu", "fri", "sat", "sun"].index(d[:3].lower()), h, m
+    except Exception:
+        return default
+
+
+def _parse_time(spec: str, default=(19, 45)) -> tuple[int, int]:
+    try:
+        h, m = (int(x) for x in spec.split(":"))
+        return h, m
+    except Exception:
+        return default
+
+
+def _posted(week: int, kind: str, day: str | None = None) -> bool:
     with _conn() as c:
-        return c.execute("SELECT 1 FROM nfl_parlay_legs WHERE season=? AND week=?",
-                         (SEASON, week)).fetchone() is not None
+        if day:
+            return c.execute("SELECT 1 FROM nfl_parlay_legs WHERE season=? AND week=? AND kind=? AND ticket LIKE ?",
+                             (SEASON, week, kind, f"%-{day}")).fetchone() is not None
+        return c.execute("SELECT 1 FROM nfl_parlay_legs WHERE season=? AND week=? AND kind=?",
+                         (SEASON, week, kind)).fetchone() is not None
+
+
+def _mark_skip(week: int, kind: str, day: str | None = None):
+    ticket = f"{SEASON}-W{week}-{kind}-skip" + (f"-{day}" if day else "")
+    with _conn() as c:
+        c.execute("INSERT OR IGNORE INTO nfl_parlay_legs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (SEASON, week, kind, ticket, int(time.time()), "__none__", "no ticket", "", "pass", "", 0,
+                   0, "", 0, 0, 0, None, "skip"))
+
+
+async def post_kind(bot, kind: str, week: int, prime: bool = False, day: str | None = None) -> bool:
+    week, book, legs, note = await asyncio.to_thread(build, kind, week, None, prime)
+    ok = await _post(bot, ticket_embed(kind, week, book, legs, dry=False, note=note))
+    if ok and legs:
+        t = store(kind, week, book, legs)
+        if day:
+            with _conn() as c:
+                c.execute("UPDATE nfl_parlay_legs SET ticket=? WHERE ticket=?", (t + f"-{day}", t))
+    elif ok:
+        _mark_skip(week, kind, day)
+    return ok
 
 
 async def weekly_task(bot):
@@ -433,156 +638,39 @@ async def weekly_task(bot):
         await asyncio.to_thread(ratio_table)
     except Exception:
         log.exception("ratio table fit failed — parlays off until it succeeds")
-    try:
-        day_s, hm = POST_ET.split()
-        post_day = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"].index(day_s[:3].lower())
-        hh, mm = (int(x) for x in hm.split(":"))
-    except Exception:
-        log.error("NFL_PARLAY_POST_ET %r unparseable — using Sun 11:45", POST_ET)
-        post_day, hh, mm = 6, 11, 45
-    log.info("nflparlay: weekly post %s (%s ET) • bars P≥%.2f edge≥%.2f price≥%d • record grading Tue",
-             f"-> channel {CHANNEL_ID}" if CHANNEL_ID else "OFF (no NFL_PARLAY_CHANNEL_ID; /nflparlay only)",
-             POST_ET, BAR_P, BAR_EDGE, MIN_PRICE)
-    graded_day = None
+    pd_, ph, pm = _parse_day_time(POST_ET)
+    prh, prm = _parse_time(PRIME_ET)
+    rd, rh, rm = _parse_day_time(RECAP_ET, (1, 10, 0))
+    log.info("nflparlay v2: Sunday tickets %s (general/rush/rec/td), primetime SGP %s ET, recap %s • %s",
+             POST_ET, PRIME_ET, RECAP_ET,
+             f"-> channel {CHANNEL_ID}" if CHANNEL_ID else "OFF (no NFL_PARLAY_CHANNEL_ID; commands only)")
+    last_recap = None
     while not bot.is_closed():
         now = datetime.now(ET)
         try:
-            if now.weekday() == 1 and graded_day != now.date():       # Tuesday: grade last week
-                n = await asyncio.to_thread(grade_legs)
-                graded_day = now.date()
-                if n:
-                    log.info("nflparlay: graded %d leg(s)", n)
-            if CHANNEL_ID and now.weekday() == post_day and (now.hour, now.minute) >= (hh, mm):
+            if CHANNEL_ID and now.weekday() == rd and (now.hour, now.minute) >= (rh, rm) and last_recap != now.date():
+                await asyncio.to_thread(grade)
                 wk = await asyncio.to_thread(current_week)
-                if not _already_posted(wk):
-                    week, rows, legs = await asyncio.to_thread(build_week, wk)
-                    ok = await _post(bot, slate_embed(week, rows, legs, dry=False))
-                    if ok and legs:
-                        store_legs(week, legs)
-                    if ok and not legs:
-                        # remember the no-parlay verdict so we don't repost all day
-                        with _conn() as c:
-                            c.execute("INSERT OR IGNORE INTO nfl_parlay_legs VALUES "
-                                      "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                                      (SEASON, week, int(time.time()), "__none__", "no parlay", "",
-                                       "pass", "", 0, 0, "", 0, 0, 0, None, "skip"))
+                txt = record_text(week=wk - 1)
+                if not txt.startswith("No legs"):
+                    await _post(bot, content=f"**Week {wk - 1} recap**\n```\n{txt[:1800]}\n```")
+                last_recap = now.date()
+            if CHANNEL_ID and now.weekday() == pd_ and (now.hour, now.minute) >= (ph, pm):
+                wk = await asyncio.to_thread(current_week)
+                for kind in ("general", "rush", "rec", "td"):
+                    if not _posted(wk, kind):
+                        await post_kind(bot, kind, wk)
+                        await asyncio.sleep(3)
+            if CHANNEL_ID and (now.hour, now.minute) >= (prh, prm) and now.hour < 23:
+                pe = await asyncio.to_thread(primetime_events)
+                if pe:
+                    wk = await asyncio.to_thread(current_week)
+                    day = now.strftime("%a").lower()
+                    if not _posted(wk, "sgp", day):
+                        await post_kind(bot, "sgp", wk, prime=True, day=day)
         except Exception:
             log.exception("nflparlay weekly task failed")
-        await asyncio.sleep(600)
-
-
-# ------------------------------------------------------------------ backtest
-
-BT_MARKETS = ",".join(M.ODDS_MARKET.values())
-
-
-def _snapshot_iso(kick_utc: datetime, hours_before: float = 1.0) -> str:
-    return (kick_utc - timedelta(hours=hours_before)).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-async def backtest(season: int, progress) -> str:
-    """Grade the model on `season` with real pre-kick lines. `progress(text)`
-    is awaited with running status. Returns the receipts text."""
-    cur = nfl_data.load_season("stats", season)
-    pri = nfl_data.load_season("stats", season - 1)
-    fit_cur = nfl_data.load_season("stats", season - 1)
-    fit_pri = nfl_data.load_season("stats", season - 2)
-    games = nfl_data.games_all()
-    if cur.empty or pri.empty or fit_pri.empty:
-        return f"Missing nflverse seasons for {season} (need {season - 2}..{season})."
-    await progress(f"fitting ratio table on {season - 1} (prior {season - 2})…")
-    rt = await asyncio.to_thread(M.RatioTable().fit, fit_cur, fit_pri, games, season - 1,
-                                 range(3, 19), None, nfl_data.load_season("snaps", season - 1))
-    snaps = nfl_data.load_season("snaps", season)
-    actual = cur[cur["season_type"] == "REG"].set_index(["player_id", "week"])
-    sched = games[(games["season"] == season) & (games["game_type"] == "REG")]
-    cal_rows, mkt_rows, legs_all = [], [], []
-    units = 0.0
-    w = l = 0
-    pw = pl_ = 0
-    spent0 = nfl_odds.credits_spent()
-    for wk in range(3, 19):
-        wkg = sched[sched["week"] == wk]
-        if wkg.empty:
-            continue
-        projs = await asyncio.to_thread(M.project, cur, pri, wk, games, season, snaps)
-        # one events listing at the week's first kickoff
-        first = wkg.sort_values("gameday").iloc[0]
-        kick0 = datetime.fromisoformat(f"{first['gameday']}T{first['gametime']}").replace(tzinfo=ET).astimezone(timezone.utc)
-        events = await asyncio.to_thread(nfl_odds.get_historical_events, _snapshot_iso(kick0, 24))
-        ev_by_teams = {}
-        for ev in events:
-            h, a = _team_from_full(ev.get("home_team")), _team_from_full(ev.get("away_team"))
-            if h and a:
-                ev_by_teams[(h, a)] = ev
-        lines: dict[tuple[str, str], dict] = {}
-        for _, g in wkg.iterrows():
-            ev = ev_by_teams.get((g["home_team"], g["away_team"]))
-            if not ev:
-                continue
-            kick = datetime.fromisoformat(f"{g['gameday']}T{g['gametime']}").replace(tzinfo=ET).astimezone(timezone.utc)
-            data = await asyncio.to_thread(nfl_odds.get_historical_event_props, ev["id"], BT_MARKETS,
-                                           _snapshot_iso(kick, 1))
-            if not data:
-                continue
-            for (odds_mk, player, book), q in nflprops.extract_quotes(data).items():
-                mk = next(k for k, v in M.ODDS_MARKET.items() if v == odds_mk)
-                if q.get("line") is None:
-                    continue
-                e = lines.setdefault((norm_name(player), mk), {"over": None, "under": None,
-                                                              "teams": {g["home_team"], g["away_team"]}})
-                for side in ("over", "under"):
-                    pr_ = q.get(side)
-                    if pr_ is not None and (e[side] is None or pr_ > e[side][1]):
-                        e[side] = (float(q["line"]), int(pr_), book)
-        rows = evaluate(projs, lines, rt)
-        graded = []
-        for r in rows:
-            key = (r["player_id"], wk)
-            if key not in actual.index:
-                continue
-            a = actual.loc[key]
-            a = a.iloc[0] if isinstance(a, pd.DataFrame) else a
-            y = float(a[M.MARKETS[r["market"]][1]])
-            r["actual"] = y
-            r["hit"] = 1 if (y > r["line"] if r["side"] == "over" else y < r["line"]) else 0
-            cal_rows.append((r["p_over"], 1 if y > r["line"] else 0))
-            if r["market_p_over"] is not None:
-                mkt_rows.append((r["market_p_over"], 1 if y > r["line"] else 0))
-            graded.append(r)
-        legs = pick_legs(graded)
-        for r in legs:
-            legs_all.append((wk, r))
-            if r["hit"]:
-                w += 1
-                units += _dec(r["price"]) - 1
-            else:
-                l += 1
-                units -= 1
-        if legs:
-            if all(r["hit"] for r in legs):
-                pw += 1
-            else:
-                pl_ += 1
-        await progress(f"week {wk}: {len(rows)} lined, {len(graded)} graded, {len(legs)} legs → "
-                       f"legs {w}-{l} {units:+.1f}u, parlays {pw}-{pl_} • "
-                       f"{nfl_odds.credits_spent() - spent0} credits")
-    out = [f"NFL backtest {season} — model fit {season - 1}/{season - 2}, lines = best price ~1h pre-kick",
-           f"credits used: {nfl_odds.credits_spent() - spent0}", "",
-           "MODEL calibration (P(over) vs actual over, ALL lined player-markets):",
-           M.calibration_table(cal_rows), "",
-           "MARKET calibration (de-vigged P(over), same rows):",
-           M.calibration_table(mkt_rows), "",
-           f"LEGS at the bars (P≥{BAR_P:.2f}, edge≥{BAR_EDGE:.2f}, price≥{MIN_PRICE}, 1 per team, ≤{MAX_LEGS}):",
-           f"  {w}-{l}  {units:+.2f}u flat 1u/leg  ({(w / (w + l)):.1%} hit)" if (w + l) else "  no legs cleared",
-           f"PARLAYS (all legs must hit): {pw}-{pl_}"]
-    if legs_all:
-        out.append("")
-        out.append("legs by week:")
-        for wk, r in legs_all:
-            out.append(f"  W{wk} {'✅' if r['hit'] else '❌'} {r['player']} {r['side']} {r['line']} "
-                       f"{MK_LABEL[r['market']]} ({_fmt(r['price'])}) model {r['p']:.0%} → {r['actual']:.0f}")
-    return "\n".join(out)
+        await asyncio.sleep(300)
 
 
 # ------------------------------------------------------------------ commands
@@ -607,12 +695,16 @@ def _guarded(fn):
     return run
 
 
+KIND_CHOICES = [app_commands.Choice(name=v, value=k) for k, v in KIND_LABEL.items()]
 DESC = {
-    "nflparlay": "Build this week's NFL parlay from the model + tracked lines (dry run unless post)",
-    "nflparlay.post": "Post it to the parlay channel and log the legs (default: dry run)",
-    "nflrecord": "Forward log: every posted NFL parlay leg, graded, with units",
-    "nflbacktest": "Grade the model on a past season with real pre-kick lines (~8.5K credits)",
-    "nflbacktest.season": "Season to grade (default: last season)",
+    "nflparlay": "Build an NFL parlay now — pick the kind (dry run unless post)",
+    "nflparlay.kind": "Which ticket to build",
+    "nflparlay.game": "Optional: a team — restrict to that game (SGP uses the next kickoff otherwise)",
+    "nflparlay.post": "Post to the parlay channel and log the legs (default: dry run)",
+    "nflparlay.min_odds": "Optional: lowest American price per leg (e.g. -150 or 150)",
+    "nflparlay.max_odds": "Optional: highest American price per leg (e.g. 400)",
+    "nflrecord": "Forward log: every posted NFL parlay leg, graded, by ticket kind",
+    "nflrecord.kind": "Optional: one ticket kind",
 }
 
 
@@ -626,52 +718,38 @@ def setup(bot):
     tree = bot.tree
 
     @tree.command(name="nflparlay", description=DESC["nflparlay"])
-    @app_commands.describe(post=DESC["nflparlay.post"])
+    @app_commands.describe(kind=DESC["nflparlay.kind"], game=DESC["nflparlay.game"], post=DESC["nflparlay.post"],
+                           min_odds=DESC["nflparlay.min_odds"], max_odds=DESC["nflparlay.max_odds"])
+    @app_commands.choices(kind=KIND_CHOICES)
     @_guarded
-    async def nflparlay_cmd(interaction: discord.Interaction, post: bool = False):
+    async def nflparlay_cmd(interaction: discord.Interaction, kind: app_commands.Choice[str],
+                            game: str | None = None, post: bool = False,
+                            min_odds: int | None = None, max_odds: int | None = None):
         await interaction.response.defer()
-        week, rows, legs = await asyncio.to_thread(build_week)
+        week, book, legs, note = await asyncio.to_thread(build, kind.value, None, game, False, min_odds, max_odds)
         if post and not CHANNEL_ID:
-            await interaction.followup.send("NFL_PARLAY_CHANNEL_ID isn't set — showing a dry run instead.")
+            await interaction.followup.send("NFL_PARLAY_CHANNEL_ID isn't set — dry run instead.")
             post = False
-        emb = slate_embed(week, rows, legs, dry=not post)
+        emb = ticket_embed(kind.value, week, book, legs, dry=not post, note=note)
         if post:
             ok = await _post(bot, emb)
             if ok and legs:
-                store_legs(week, legs)
+                store(kind.value, week, book, legs)
             await interaction.followup.send("Posted." if ok else "Post failed — check the log.")
         else:
             await interaction.followup.send(embed=emb)
 
     @tree.command(name="nflrecord", description=DESC["nflrecord"])
+    @app_commands.describe(kind=DESC["nflrecord.kind"])
+    @app_commands.choices(kind=KIND_CHOICES)
     @_guarded
-    async def nflrecord_cmd(interaction: discord.Interaction):
+    async def nflrecord_cmd(interaction: discord.Interaction, kind: app_commands.Choice[str] | None = None):
         await interaction.response.defer()
-        await asyncio.to_thread(grade_legs)
-        txt = record_text()
-        for ch in _chunks(txt):
+        await asyncio.to_thread(grade)
+        for ch in _chunks(record_text(kind.value if kind else None)):
             await interaction.followup.send(f"```\n{ch}\n```")
 
-    @tree.command(name="nflbacktest", description=DESC["nflbacktest"])
-    @app_commands.describe(season=DESC["nflbacktest.season"])
-    @_guarded
-    async def nflbacktest_cmd(interaction: discord.Interaction, season: int | None = None):
-        await interaction.response.defer()
-        season = season or SEASON - 1
-        msg = await interaction.followup.send(f"NFL backtest {season} starting…", wait=True)
-        lines_: list[str] = []
-
-        async def progress(t: str):
-            lines_.append(t)
-            try:
-                await msg.edit(content="```\n" + "\n".join(lines_[-12:]) + "\n```")
-            except Exception:
-                pass
-        txt = await backtest(season, progress)
-        for ch in _chunks(txt):
-            await interaction.followup.send(f"```\n{ch}\n```")
-
-    log.info("nflparlay: registered /nflparlay /nflrecord /nflbacktest")
+    log.info("nflparlay v2: registered /nflparlay /nflrecord")
 
 
 def start(bot):
