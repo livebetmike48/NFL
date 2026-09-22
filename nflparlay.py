@@ -21,12 +21,18 @@ bot builds both and posts the stronger one, with a betslip link per leg
 LINES: fetched on demand for the slate -- 9 markets x ~16 games ~= 144
 credits per build; cached 15 min so the four Sunday tickets share one fetch.
 
-SCHEDULE (ET):
-  NFL_PARLAY_POST_ET     default "Sun 11:45"  -> general, rush, rec, td
-  NFL_PRIMETIME_POST_ET  default "19:45"      -> sgp on any game kicking
-                                                 off 7pm-midnight that day
-                                                 (Thu / Sun / Mon)
-  NFL_RECAP_POST_ET      default "Tue 10:00"  -> graded recap of last week
+SCHEDULE (ET) -- driven by the actual kickoffs, not fixed clock times:
+  DAY slate    = games kicking 11am-6pm ET on a day. Posts NFL_LEAD_MIN
+                 (default 75) before the FIRST day kickoff -> 1pm = 11:45.
+                 SUNDAY gets the four tickets (general, rush, rec, td);
+                 any other day (late-season Saturday, Thanksgiving,
+                 Christmas) gets ONE general ticket.
+  EVENING slate = games kicking 6pm or later (TNF, SNF, MNF, Sat night).
+                 ONE ticket, NFL_PRIME_LEAD_MIN (default 30) before the
+                 first evening kickoff: a Same Game Parlay if one game,
+                 a Primetime Parlay drawing from all of them if several.
+  Early games (before 11am ET -- London/Germany) are never on a ticket.
+  NFL_RECAP_POST_ET  default "Tue 10:00"  -> graded recap of last week.
 Posting needs NFL_PARLAY_CHANNEL_ID; otherwise everything is command-only.
 
 Every posted leg is stored and graded against nflverse box scores.
@@ -59,9 +65,10 @@ ET = ZoneInfo("America/New_York")
 
 SEASON = nfl_data.SEASON
 CHANNEL_ID = int(os.getenv("NFL_PARLAY_CHANNEL_ID", "0") or 0)
-POST_ET = os.getenv("NFL_PARLAY_POST_ET", "Sun 11:45")
-PRIME_ET = os.getenv("NFL_PRIMETIME_POST_ET", "19:45")
+LEAD_MIN = int(os.getenv("NFL_LEAD_MIN", "75") or 75)           # day slate: minutes before 1st kick
+PRIME_LEAD_MIN = int(os.getenv("NFL_PRIME_LEAD_MIN", "30") or 30)  # evening: minutes before 1st kick
 RECAP_ET = os.getenv("NFL_RECAP_POST_ET", "Tue 10:00")
+DAY_START_H, EVENING_H = 11, 18     # ET: <11am = early (skipped), >=6pm = evening
 WEBHOOK_NAME = "LBM NFL Parlay"
 DISPLAY_NAME = os.getenv("NFL_PARLAY_NAME", "NFL Parlay")
 BOOKS = ["fanduel", "draftkings"]
@@ -94,9 +101,11 @@ KINDS = {
     "sgp":     dict(markets=["pass", "rush", "rec", "recs", "td"], sides=["over", "under", "yes"],
                     p=0.58, edge=0.04, min_price=-150, max_price=400, max_legs=5, min_legs=2, per_team=99),
 }
+KINDS["prime"] = KINDS["sgp"]        # several evening games: same bars, legs from any of them
 KIND_LABEL = {"general": "Parlay", "pass": "Passing Yards Parlay", "rush": "Rushing Yards Parlay",
               "rec": "Receiving Yards Parlay", "recs": "Receptions Parlay", "td": "Anytime TD Parlay",
-              "alt": "Alt-Line Parlay", "reverse": "Big-Play Parlay", "sgp": "Same Game Parlay"}
+              "alt": "Alt-Line Parlay", "reverse": "Big-Play Parlay", "sgp": "Same Game Parlay",
+              "prime": "Primetime Parlay"}
 # reverse (same-player pairs) has its own bars
 REVERSE = dict(p=0.50, edge=0.02, min_price=-150, max_pairs=3, adot=11.0, ypr=13.0, min_rec=5)
 
@@ -182,16 +191,22 @@ def slate_events(now: int | None = None) -> list[dict]:
     return sorted(out, key=lambda e: e["kick"])
 
 
-def primetime_events(now: int | None = None) -> list[dict]:
-    """Games kicking off 7pm-midnight ET today."""
+def _slot(kick: int) -> str:
+    h = datetime.fromtimestamp(kick, ET).hour
+    return "early" if h < DAY_START_H else "evening" if h >= EVENING_H else "day"
+
+
+def day_slate(now: int | None = None, slot: str = "day") -> list[dict]:
+    """Today's (ET) still-to-kick games in one slot: 'day' = 11am-6pm,
+    'evening' = 6pm+. Early games are never returned."""
     now = now or int(time.time())
     today = datetime.fromtimestamp(now, ET).date()
-    out = []
-    for e in slate_events(now):
-        k = datetime.fromtimestamp(e["kick"], ET)
-        if k.date() == today and k.hour >= 19:
-            out.append(e)
-    return out
+    return [e for e in slate_events(now)
+            if datetime.fromtimestamp(e["kick"], ET).date() == today and _slot(e["kick"]) == slot]
+
+
+def primetime_events(now: int | None = None) -> list[dict]:
+    return day_slate(now, "evening")
 
 
 _quote_cache: dict[str, tuple[float, list[dict]]] = {}
@@ -445,19 +460,23 @@ def ticket_embed(kind: str, week: int, book: str | None, legs: list[dict], dry: 
 # ------------------------------------------------------------------ build
 
 def build(kind: str, week: int | None = None, game: str | None = None, prime: bool = False,
-          min_price: int | None = None, max_price: int | None = None
-          ) -> tuple[int, str | None, list[dict], str]:
-    """-> (week, book, legs, note). game = team text to restrict to one game."""
+          min_price: int | None = None, max_price: int | None = None,
+          events: list[dict] | None = None) -> tuple[int, str | None, list[dict], str]:
+    """-> (week, book, legs, note). game = team text to restrict to one game;
+    events = an explicit slate (the scheduler passes today's day/evening games)."""
     week = week or current_week()
-    events = primetime_events() if prime else slate_events()
+    if events is None:
+        events = primetime_events() if prime else [e for e in slate_events() if _slot(e["kick"]) != "early"]
+    if kind == "prime" and len(events) == 1:
+        kind = "sgp"
     note = ""
     if game:
         t = nfl_data.resolve_team(game)
         events = [e for e in events if t in (e["home"], e["away"])]
         if not events:
             return week, None, [], f" — no upcoming game for {game}"
-    if kind == "sgp" and not game and not prime:
-        events = events[:1] if events else []      # next kickoff
+    if kind == "sgp" and not game and not prime and len(events) > 1:
+        events = events[:1]                          # next kickoff
     if not events:
         return week, None, [], " — no games in the window"
     cands = candidates(week, events)
@@ -594,14 +613,6 @@ def _parse_day_time(spec: str, default=(6, 11, 45)) -> tuple[int, int, int]:
         return default
 
 
-def _parse_time(spec: str, default=(19, 45)) -> tuple[int, int]:
-    try:
-        h, m = (int(x) for x in spec.split(":"))
-        return h, m
-    except Exception:
-        return default
-
-
 def _posted(week: int, kind: str, day: str | None = None) -> bool:
     with _conn() as c:
         if day:
@@ -619,8 +630,10 @@ def _mark_skip(week: int, kind: str, day: str | None = None):
                    0, "", 0, 0, 0, None, "skip"))
 
 
-async def post_kind(bot, kind: str, week: int, prime: bool = False, day: str | None = None) -> bool:
-    week, book, legs, note = await asyncio.to_thread(build, kind, week, None, prime)
+async def post_kind(bot, kind: str, week: int, events: list[dict], day: str | None = None) -> bool:
+    if kind == "prime" and len(events) == 1:
+        kind = "sgp"
+    week, book, legs, note = await asyncio.to_thread(build, kind, week, None, False, None, None, events)
     ok = await _post(bot, ticket_embed(kind, week, book, legs, dry=False, note=note))
     if ok and legs:
         t = store(kind, week, book, legs)
@@ -638,39 +651,42 @@ async def weekly_task(bot):
         await asyncio.to_thread(ratio_table)
     except Exception:
         log.exception("ratio table fit failed — parlays off until it succeeds")
-    pd_, ph, pm = _parse_day_time(POST_ET)
-    prh, prm = _parse_time(PRIME_ET)
     rd, rh, rm = _parse_day_time(RECAP_ET, (1, 10, 0))
-    log.info("nflparlay v2: Sunday tickets %s (general/rush/rec/td), primetime SGP %s ET, recap %s • %s",
-             POST_ET, PRIME_ET, RECAP_ET,
+    log.info("nflparlay v2: Sunday 4 tickets / other days 1 ticket, %dm before the first 11am-6pm ET kickoff; "
+             "ONE evening ticket %dm before the first 6pm+ kickoff (SGP if one game), early games skipped, "
+             "recap %s • %s", LEAD_MIN, PRIME_LEAD_MIN, RECAP_ET,
              f"-> channel {CHANNEL_ID}" if CHANNEL_ID else "OFF (no NFL_PARLAY_CHANNEL_ID; commands only)")
     last_recap = None
     while not bot.is_closed():
-        now = datetime.now(ET)
+        now_dt = datetime.now(ET)
+        now = int(time.time())
         try:
-            if CHANNEL_ID and now.weekday() == rd and (now.hour, now.minute) >= (rh, rm) and last_recap != now.date():
+            if CHANNEL_ID and now_dt.weekday() == rd and (now_dt.hour, now_dt.minute) >= (rh, rm) \
+                    and last_recap != now_dt.date():
                 await asyncio.to_thread(grade)
                 wk = await asyncio.to_thread(current_week)
                 txt = record_text(week=wk - 1)
                 if not txt.startswith("No legs"):
                     await _post(bot, content=f"**Week {wk - 1} recap**\n```\n{txt[:1800]}\n```")
-                last_recap = now.date()
-            if CHANNEL_ID and now.weekday() == pd_ and (now.hour, now.minute) >= (ph, pm):
-                wk = await asyncio.to_thread(current_week)
-                for kind in ("general", "rush", "rec", "td"):
-                    if not _posted(wk, kind):
-                        await post_kind(bot, kind, wk)
-                        await asyncio.sleep(3)
-            if CHANNEL_ID and (now.hour, now.minute) >= (prh, prm) and now.hour < 23:
-                pe = await asyncio.to_thread(primetime_events)
-                if pe:
+                last_recap = now_dt.date()
+            if CHANNEL_ID:
+                day = now_dt.strftime("%a%d").lower()          # e.g. sun27 — dedupe per calendar day
+                day_games = await asyncio.to_thread(day_slate, now, "day")
+                if day_games and now >= min(e["kick"] for e in day_games) - LEAD_MIN * 60:
                     wk = await asyncio.to_thread(current_week)
-                    day = now.strftime("%a").lower()
-                    if not _posted(wk, "sgp", day):
-                        await post_kind(bot, "sgp", wk, prime=True, day=day)
+                    kinds = ("general", "rush", "rec", "td") if now_dt.weekday() == 6 else ("general",)
+                    for kind in kinds:
+                        if not _posted(wk, kind, day):
+                            await post_kind(bot, kind, wk, day_games, day)
+                            await asyncio.sleep(3)
+                eve = await asyncio.to_thread(day_slate, now, "evening")
+                if eve and now >= min(e["kick"] for e in eve) - PRIME_LEAD_MIN * 60:
+                    wk = await asyncio.to_thread(current_week)
+                    if not _posted(wk, "prime", day) and not _posted(wk, "sgp", day):
+                        await post_kind(bot, "prime", wk, eve, day)
         except Exception:
             log.exception("nflparlay weekly task failed")
-        await asyncio.sleep(300)
+        await asyncio.sleep(60)
 
 
 # ------------------------------------------------------------------ commands
@@ -695,7 +711,7 @@ def _guarded(fn):
     return run
 
 
-KIND_CHOICES = [app_commands.Choice(name=v, value=k) for k, v in KIND_LABEL.items()]
+KIND_CHOICES = [app_commands.Choice(name=v, value=k) for k, v in KIND_LABEL.items() if k != "prime"]
 DESC = {
     "nflparlay": "Build an NFL parlay now — pick the type (dry run unless post)",
     "nflparlay.kind": "Which ticket type to build",
