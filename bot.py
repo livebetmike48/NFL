@@ -17,6 +17,7 @@ import discord
 from dotenv import load_dotenv
 
 import nflprops
+import nflparlay
 import nflstats
 
 load_dotenv()
@@ -38,6 +39,7 @@ class NFLBot(discord.Client):
     async def setup_hook(self):
         nflprops.setup(self)
         nflstats.setup(self)
+        nflparlay.setup(self)
         cmds = await self.tree.sync()
         log.info("synced %d command(s): %s", len(cmds),
                  ", ".join(f"/{c.name}" for c in cmds))
@@ -47,6 +49,7 @@ class NFLBot(discord.Client):
         log.info("Logged in as %s", self.user)
         nflprops.start(self)
         nflstats.start(self)
+        nflparlay.start(self)
 
 
 if __name__ == "__main__":
