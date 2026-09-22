@@ -92,3 +92,36 @@ def get_event_props(event_id: str, markets: str) -> dict | None:
     if data is not None:
         _spent += len(markets.split(",")) * len(REGIONS.split(","))
     return data if isinstance(data, dict) else None
+
+
+# ---------------------------------------------------------------- historical
+# The Odds API historical endpoints (for /nflbacktest). Cost is 10x live:
+#   /historical/.../events                 -> 1 credit per call
+#   /historical/.../events/{id}/odds       -> 10 x markets x regions per call
+# Each call returns the snapshot at or just before `date` (ISO 8601 UTC).
+# Player props are available historically from May 2023 onward.
+
+HIST_EVENT_CREDITS = 10
+
+
+def get_historical_events(date_iso: str) -> list:
+    """Events as they stood at `date_iso`. -> list (1 credit)."""
+    global _spent
+    data = _get(f"/historical/sports/{SPORT}/events", {"date": date_iso})
+    if data is not None:
+        _spent += 1
+    return (data or {}).get("data", []) if isinstance(data, dict) else []
+
+
+def get_historical_event_props(event_id: str, markets: str, date_iso: str) -> dict | None:
+    """Player props snapshot for one event at `date_iso`.
+    -> event odds dict (10 x markets x regions credits)."""
+    global _spent
+    if not event_id or not markets:
+        return None
+    data = _get(f"/historical/sports/{SPORT}/events/{event_id}/odds",
+                {"regions": REGIONS, "markets": markets, "date": date_iso,
+                 "oddsFormat": "american"})
+    if data is not None:
+        _spent += HIST_EVENT_CREDITS * len(markets.split(",")) * len(REGIONS.split(","))
+    return data.get("data") if isinstance(data, dict) else None
