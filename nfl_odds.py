@@ -81,14 +81,20 @@ def get_events() -> list:
     return data if isinstance(data, list) else []
 
 
-def get_event_props(event_id: str, markets: str) -> dict | None:
-    """Player props for ONE event. Costs len(markets) x len(regions) credits."""
+def get_event_props(event_id: str, markets: str, bookmakers: str | None = None,
+                    links: bool = False) -> dict | None:
+    """Player props for ONE event. Costs len(markets) x len(regions) credits
+    (a `bookmakers` filter does not change the cost). links=True adds the
+    bookmaker deep links (event/market/outcome) used for betslip buttons."""
     global _spent
     if not event_id or not markets:
         return None
-    data = _get(f"/sports/{SPORT}/events/{event_id}/odds",
-                {"regions": REGIONS, "markets": markets,
-                 "oddsFormat": "american"})
+    params = {"regions": REGIONS, "markets": markets, "oddsFormat": "american"}
+    if bookmakers:
+        params["bookmakers"] = bookmakers
+    if links:
+        params["includeLinks"] = "true"
+    data = _get(f"/sports/{SPORT}/events/{event_id}/odds", params)
     if data is not None:
         _spent += len(markets.split(",")) * len(REGIONS.split(","))
     return data if isinstance(data, dict) else None
