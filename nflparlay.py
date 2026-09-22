@@ -7,9 +7,10 @@ NFL PARLAY -- Phase 3 of the NFL bot. Bot Cooks architecture, NFL data.
         -> one leg per TEAM (no same-game stacking), sorted by edge
         -> leg count is the OUTPUT; "no parlay this week" when nothing clears
 
-Posts once a week (Wednesday NFL_PARLAY_POST_ET, default 12:00) through a
-webhook displaying as "NFL Parlay" -- only after /nflbacktest has been run
-and NFL_PARLAY_CHANNEL_ID is set. Every leg is stored and graded against
+Posts once a week on game day (NFL_PARLAY_POST_ET, default "Sun 11:45" --
+after the 1pm-slate inactives drop at ~11:30 ET, before kickoff) through a
+webhook displaying as "NFL Parlay", when NFL_PARLAY_CHANNEL_ID is set.
+Thursday/Friday games are already played by then and are not on the slate. Every leg is stored and graded against
 nflverse box scores the following Tuesday (/nflrecord = the public
 forward log).
 
@@ -68,7 +69,11 @@ MAX_LEGS = max(2, int(os.getenv("NFL_MAX_LEGS", "6")))
 MIN_GAMES = int(os.getenv("NFL_MIN_GAMES", "2"))
 # floor on the posted line -- keeps 1.5-yard novelty props out of the slate
 MIN_LINE = {"pass": 150.0, "rush": 20.0, "rec": 15.0}
-POST_ET = os.getenv("NFL_PARLAY_POST_ET", "12:00")
+# Disagreement gate: when the line sits this far from the projection the
+# market is pricing something the usage data can't see yet (a teammate's
+# injury, a promotion). That is missing information, not an edge -> skip.
+MAX_DISAGREE = float(os.getenv("NFL_MAX_DISAGREE", "0.35"))
+POST_ET = os.getenv("NFL_PARLAY_POST_ET", "Sun 11:45")   # "<Day> HH:MM" ET
 CHANNEL_ID = int(os.getenv("NFL_PARLAY_CHANNEL_ID", "0") or 0)
 WEBHOOK_NAME = "LBM NFL Parlay"
 DISPLAY_NAME = os.getenv("NFL_PARLAY_NAME", "NFL Parlay")
@@ -118,7 +123,8 @@ def _fit_ratio_table(progress=None) -> M.RatioTable:
     cur = nfl_data.load_season("stats", fit_season)
     pri = nfl_data.load_season("stats", prior_season)
     games = nfl_data.games_all()
-    rt = M.RatioTable().fit(cur, pri, games, fit_season, progress=progress)
+    rt = M.RatioTable().fit(cur, pri, games, fit_season, progress=progress,
+                            snaps=nfl_data.load_season("snaps", fit_season))
     try:
         with open(RATIO_PATH, "w") as f:
             json.dump(rt.to_dict(), f)
@@ -249,7 +255,8 @@ def pick_legs(rows: list[dict]) -> list[dict]:
     ok = [r for r in rows
           if r["p"] >= BAR_P and r["edge"] >= BAR_EDGE and r["price"] >= MIN_PRICE
           and r["games_cur"] >= MIN_GAMES and r["injury"] not in ("Out", "Doubtful")
-          and r["line"] >= MIN_LINE[r["market"]]]
+          and r["line"] >= MIN_LINE[r["market"]]
+          and abs(r["line"] - r["proj"]) / max(r["line"], 1.0) <= MAX_DISAGREE]
     ok.sort(key=lambda r: -r["edge"])
     legs, teams = [], set()
     for r in ok:
@@ -287,7 +294,7 @@ def build_week(week: int | None = None) -> tuple[int, list[dict], list[dict]]:
     cur = nfl_data.load_season("stats", SEASON)
     pri = nfl_data.load_season("stats", SEASON - 1)
     games = nfl_data.games_all()
-    projs = M.project(cur, pri, week, games, SEASON)
+    projs = M.project(cur, pri, week, games, SEASON, nfl_data.load_season("snaps", SEASON))
     rows = evaluate(projs, tracker_lines(), ratio_table(), injury_gate(week))
     return week, rows, pick_legs(rows)
 
@@ -296,7 +303,8 @@ def slate_embed(week: int, rows: list[dict], legs: list[dict], dry: bool) -> dis
     if not legs:
         e = discord.Embed(title=f"Week {week} — no parlay", color=0x95a5a6,
                           description=(f"{len(rows)} player-markets had lines; none cleared the bars "
-                                       f"(P ≥ {BAR_P:.2f}, edge ≥ {BAR_EDGE:.2f}, price ≥ {MIN_PRICE})."))
+                                       f"(P ≥ {BAR_P:.2f}, edge ≥ {BAR_EDGE:.2f}, price ≥ {MIN_PRICE}, "
+                                       f"line within {MAX_DISAGREE:.0%} of projection)."))
         return e
     e = discord.Embed(title=f"Week {week} NFL parlay — {len(legs)} legs ({_fmt(parlay_price(legs))})",
                       color=0x2ecc71)
@@ -306,8 +314,10 @@ def slate_embed(week: int, rows: list[dict], legs: list[dict], dry: bool) -> dis
             name=f"{r['player']} {r['side'].upper()} {r['line']} {MK_LABEL[r['market']]} ({_fmt(r['price'])} {nflprops.BOOK_NAMES.get(r['book'], r['book'])}){flag}",
             value=f"model {r['p']:.0%} vs implied {r['implied']:.0%} (+{r['edge']*100:.1f} pts) • {r['why']}",
             inline=False)
-    e.set_footer(text=("DRY RUN • " if dry else "") + f"{len(rows)} candidates • one leg per team • "
-                 f"bars P≥{BAR_P:.2f} edge≥{BAR_EDGE:.2f} • graded Tuesdays in /nflrecord")
+    gated = sum(1 for r in rows if abs(r["line"] - r["proj"]) / max(r["line"], 1.0) > MAX_DISAGREE)
+    e.set_footer(text=("DRY RUN • " if dry else "") + f"{len(rows)} candidates, {gated} skipped (line >{MAX_DISAGREE:.0%} "
+                 f"from projection = role change) • one leg per team • bars P≥{BAR_P:.2f} edge≥{BAR_EDGE:.2f} • "
+                 f"graded Tuesdays in /nflrecord")
     return e
 
 
@@ -423,8 +433,14 @@ async def weekly_task(bot):
         await asyncio.to_thread(ratio_table)
     except Exception:
         log.exception("ratio table fit failed — parlays off until it succeeds")
-    hh, mm = (int(x) for x in POST_ET.split(":"))
-    log.info("nflparlay: weekly post %s (Wed %s ET) • bars P≥%.2f edge≥%.2f price≥%d • record grading Tue",
+    try:
+        day_s, hm = POST_ET.split()
+        post_day = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"].index(day_s[:3].lower())
+        hh, mm = (int(x) for x in hm.split(":"))
+    except Exception:
+        log.error("NFL_PARLAY_POST_ET %r unparseable — using Sun 11:45", POST_ET)
+        post_day, hh, mm = 6, 11, 45
+    log.info("nflparlay: weekly post %s (%s ET) • bars P≥%.2f edge≥%.2f price≥%d • record grading Tue",
              f"-> channel {CHANNEL_ID}" if CHANNEL_ID else "OFF (no NFL_PARLAY_CHANNEL_ID; /nflparlay only)",
              POST_ET, BAR_P, BAR_EDGE, MIN_PRICE)
     graded_day = None
@@ -436,7 +452,7 @@ async def weekly_task(bot):
                 graded_day = now.date()
                 if n:
                     log.info("nflparlay: graded %d leg(s)", n)
-            if CHANNEL_ID and now.weekday() == 2 and (now.hour, now.minute) >= (hh, mm):
+            if CHANNEL_ID and now.weekday() == post_day and (now.hour, now.minute) >= (hh, mm):
                 wk = await asyncio.to_thread(current_week)
                 if not _already_posted(wk):
                     week, rows, legs = await asyncio.to_thread(build_week, wk)
@@ -475,7 +491,9 @@ async def backtest(season: int, progress) -> str:
     if cur.empty or pri.empty or fit_pri.empty:
         return f"Missing nflverse seasons for {season} (need {season - 2}..{season})."
     await progress(f"fitting ratio table on {season - 1} (prior {season - 2})…")
-    rt = await asyncio.to_thread(M.RatioTable().fit, fit_cur, fit_pri, games, season - 1)
+    rt = await asyncio.to_thread(M.RatioTable().fit, fit_cur, fit_pri, games, season - 1,
+                                 range(3, 19), None, nfl_data.load_season("snaps", season - 1))
+    snaps = nfl_data.load_season("snaps", season)
     actual = cur[cur["season_type"] == "REG"].set_index(["player_id", "week"])
     sched = games[(games["season"] == season) & (games["game_type"] == "REG")]
     cal_rows, mkt_rows, legs_all = [], [], []
@@ -487,7 +505,7 @@ async def backtest(season: int, progress) -> str:
         wkg = sched[sched["week"] == wk]
         if wkg.empty:
             continue
-        projs = await asyncio.to_thread(M.project, cur, pri, wk, games, season)
+        projs = await asyncio.to_thread(M.project, cur, pri, wk, games, season, snaps)
         # one events listing at the week's first kickoff
         first = wkg.sort_values("gameday").iloc[0]
         kick0 = datetime.fromisoformat(f"{first['gameday']}T{first['gametime']}").replace(tzinfo=ET).astimezone(timezone.utc)
