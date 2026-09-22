@@ -41,6 +41,9 @@ import pandas as pd
 log = logging.getLogger("nflmodel")
 
 K_VOL = 3.0      # games of shrinkage for volume
+MIN_SNAP_PCT = 0.20   # a game under this offense snap share isn't a "game played"
+PARTIAL_FRAC = 0.5    # ...nor is one under half the player's own peak share (left early)
+RECENCY = 0.6         # per-game decay for volume: last game 1.0, prior 0.6, 0.36...
 K_EFF = 8.0      # games of shrinkage for efficiency
 K_DEF = 6.0      # games of shrinkage for defense-allowed rates
 SHRINK_DEF = 0.5 # how much of a defense's deviation from league avg we apply
@@ -66,14 +69,38 @@ def _pos(df: pd.DataFrame) -> pd.Series:
 
 # ------------------------------------------------------------------ rates
 
-def _player_rates(df: pd.DataFrame) -> pd.DataFrame:
+def _drop_partial_games(df: pd.DataFrame, snaps: pd.DataFrame | None) -> pd.DataFrame:
+    """Remove partial player-games: under MIN_SNAP_PCT offense snaps, or under
+    half the player's own peak share this season (left early / limited).
+    Those weeks drag a season average down and make the market's "over"
+    look like our "under"."""
+    if snaps is None or snaps.empty or df.empty:
+        return df
+    sn = snaps[["season", "week", "player", "team", "offense_pct"]].copy()
+    sn["k"] = sn["player"].str.lower().str.replace(r"[^a-z ]", "", regex=True)
+    key = df["player_display_name"].str.lower().str.replace(r"[^a-z ]", "", regex=True)
+    m = df.copy().assign(k=key).merge(sn, on=["season", "week", "team", "k"], how="left")
+    peak = m.groupby("player_id")["offense_pct"].transform("max")
+    floor = (peak * PARTIAL_FRAC).clip(lower=MIN_SNAP_PCT)
+    keep = m["offense_pct"].isna() | (m["offense_pct"] >= floor)
+    return df[keep.values]
+
+
+def _player_rates(df: pd.DataFrame, recency: bool = False) -> pd.DataFrame:
     """Per-player per-game volume + efficiency over the rows given.
+    recency=True weights volume toward the most recent weeks (role changes
+    show up); efficiency is always a plain per-unit rate.
     -> index player_id; cols: name, team, pos, games, <mkt>_vol, <mkt>_eff"""
     if df.empty:
         return pd.DataFrame()
     d = df.copy()
     d["pos"] = _pos(d)
     d = d[d["pos"] != ""]
+    if recency:
+        last = d.groupby("player_id")["week"].transform("max")
+        d["w"] = RECENCY ** (last - d["week"])
+    else:
+        d["w"] = 1.0
     g = d.groupby("player_id")
     out = pd.DataFrame({
         "name": g["player_display_name"].last(),
@@ -81,10 +108,11 @@ def _player_rates(df: pd.DataFrame) -> pd.DataFrame:
         "pos": g["pos"].last(),
         "games": g["week"].nunique(),
     })
+    wsum = g["w"].sum()
     for mk, (vol, yds, _) in MARKETS.items():
         v = g[vol].sum()
         y = g[yds].sum()
-        out[f"{mk}_vol"] = v / out["games"]
+        out[f"{mk}_vol"] = (d[vol] * d["w"]).groupby(d["player_id"]).sum() / wsum
         out[f"{mk}_eff"] = (y / v).where(v > 0)
         out[f"{mk}_n"] = g[vol].apply(lambda s: int((s > 0).sum()))
     return out
@@ -161,15 +189,16 @@ class Projection:
 
 
 def project(cur: pd.DataFrame, prior: pd.DataFrame, week: int,
-            schedule: pd.DataFrame, season: int) -> list[Projection]:
+            schedule: pd.DataFrame, season: int,
+            snaps: pd.DataFrame | None = None) -> list[Projection]:
     """Point-in-time projections for every eligible player in `week`.
     cur   = this season's weekly player stats (ALL weeks; filtered here)
     prior = last season's weekly player stats
     schedule = games.csv rows for `season`"""
     cur_pt = _reg(cur)
-    cur_pt = cur_pt[cur_pt["week"] < week]
+    cur_pt = _drop_partial_games(cur_pt[cur_pt["week"] < week], snaps)
     prior_reg = _reg(prior)
-    r_cur = _player_rates(cur_pt)
+    r_cur = _player_rates(cur_pt, recency=True)
     r_pri = _player_rates(prior_reg)
     pos_eff = _pos_avg_eff(r_pri if not r_pri.empty else r_cur)
     d_cur = _defense_rates(cur_pt)
@@ -247,11 +276,12 @@ class RatioTable:
         self.tables: dict[tuple[str, str], np.ndarray] = {}
 
     def fit(self, cur: pd.DataFrame, prior: pd.DataFrame, schedule: pd.DataFrame,
-            season: int, weeks: range = range(3, 19), progress=None) -> "RatioTable":
+            season: int, weeks: range = range(3, 19), progress=None,
+            snaps: pd.DataFrame | None = None) -> "RatioTable":
         actual = _reg(cur).set_index(["player_id", "week"])
         buckets: dict[tuple[str, str], list[float]] = {}
         for wk in weeks:
-            for pr in project(cur, prior, wk, schedule, season):
+            for pr in project(cur, prior, wk, schedule, season, snaps):
                 key = (pr.player_id, wk)
                 if key not in actual.index:
                     continue          # didn't play -> prop would be void
