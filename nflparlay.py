@@ -697,14 +697,14 @@ def _guarded(fn):
 
 KIND_CHOICES = [app_commands.Choice(name=v, value=k) for k, v in KIND_LABEL.items()]
 DESC = {
-    "nflparlay": "Build an NFL parlay now — pick the kind (dry run unless post)",
-    "nflparlay.kind": "Which ticket to build",
+    "nflparlay": "Build an NFL parlay now — pick the type (dry run unless post)",
+    "nflparlay.kind": "Which ticket type to build",
     "nflparlay.game": "Optional: a team — restrict to that game (SGP uses the next kickoff otherwise)",
     "nflparlay.post": "Post to the parlay channel and log the legs (default: dry run)",
     "nflparlay.min_odds": "Optional: lowest American price per leg (e.g. -150 or 150)",
     "nflparlay.max_odds": "Optional: highest American price per leg (e.g. 400)",
     "nflrecord": "Forward log: every posted NFL parlay leg, graded, by ticket kind",
-    "nflrecord.kind": "Optional: one ticket kind",
+    "nflrecord.kind": "Optional: one ticket type",
 }
 
 
@@ -718,14 +718,15 @@ def setup(bot):
     tree = bot.tree
 
     @tree.command(name="nflparlay", description=DESC["nflparlay"])
-    @app_commands.describe(kind=DESC["nflparlay.kind"], game=DESC["nflparlay.game"], post=DESC["nflparlay.post"],
+    @app_commands.describe(type=DESC["nflparlay.kind"], game=DESC["nflparlay.game"], post=DESC["nflparlay.post"],
                            min_odds=DESC["nflparlay.min_odds"], max_odds=DESC["nflparlay.max_odds"])
-    @app_commands.choices(kind=KIND_CHOICES)
+    @app_commands.choices(type=KIND_CHOICES)
     @_guarded
-    async def nflparlay_cmd(interaction: discord.Interaction, kind: app_commands.Choice[str],
+    async def nflparlay_cmd(interaction: discord.Interaction, type: app_commands.Choice[str],
                             game: str | None = None, post: bool = False,
                             min_odds: int | None = None, max_odds: int | None = None):
         await interaction.response.defer()
+        kind = type
         week, book, legs, note = await asyncio.to_thread(build, kind.value, None, game, False, min_odds, max_odds)
         if post and not CHANNEL_ID:
             await interaction.followup.send("NFL_PARLAY_CHANNEL_ID isn't set — dry run instead.")
@@ -740,13 +741,13 @@ def setup(bot):
             await interaction.followup.send(embed=emb)
 
     @tree.command(name="nflrecord", description=DESC["nflrecord"])
-    @app_commands.describe(kind=DESC["nflrecord.kind"])
-    @app_commands.choices(kind=KIND_CHOICES)
+    @app_commands.describe(type=DESC["nflrecord.kind"])
+    @app_commands.choices(type=KIND_CHOICES)
     @_guarded
-    async def nflrecord_cmd(interaction: discord.Interaction, kind: app_commands.Choice[str] | None = None):
+    async def nflrecord_cmd(interaction: discord.Interaction, type: app_commands.Choice[str] | None = None):
         await interaction.response.defer()
         await asyncio.to_thread(grade)
-        for ch in _chunks(record_text(kind.value if kind else None)):
+        for ch in _chunks(record_text(type.value if type else None)):
             await interaction.followup.send(f"```\n{ch}\n```")
 
     log.info("nflparlay v2: registered /nflparlay /nflrecord")
