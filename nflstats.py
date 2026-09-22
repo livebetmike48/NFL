@@ -129,13 +129,15 @@ def usage_table(player_id: str) -> tuple[str, str, str] | None:
 
 # ---------------------------------------------------------------- /playerstats
 
-def playerstats_table(player_id: str) -> tuple[str, str, str] | None:
+def playerstats_table(player_id: str, last: int | None = None) -> tuple[str, str, str] | None:
     st = D.load("stats")
     if not len(st):
         return None
     p = st[st["player_id"] == player_id].sort_values("week")
     if not len(p):
         return None
+    if last:
+        p = p.tail(int(last))
     name, team, pos = p.iloc[-1]["player_display_name"], p.iloc[-1]["team"], p.iloc[-1]["position"]
     if pos == "QB":
         cols = [("Cmp", "completions", 0), ("Att", "attempts", 0), ("PaYd", "passing_yards", 0), ("PaTD", "passing_tds", 0),
@@ -155,7 +157,8 @@ def playerstats_table(player_id: str) -> tuple[str, str, str] | None:
     if len(p) >= 2:
         avg = p[[c[1] for c in cols]].mean()
         lines.append(f"{'avg':<9}" + "".join(f"{_n(avg[c[1]], 1):>6}" for c in cols))
-    return f"{name} ({team} {pos}) — {D.SEASON} game log", _code(lines), f"{len(p)} game(s) • nflverse"
+    span = f"last {len(p)}" if last else f"{D.SEASON} game log"
+    return f"{name} ({team} {pos}) — {span}", _code(lines), f"{len(p)} game(s) • nflverse"
 
 
 # ---------------------------------------------------------------- /defense
@@ -168,11 +171,23 @@ _DEF_METRICS = {
 }
 
 
-def defense_allowed(stats: pd.DataFrame, pos: str) -> pd.DataFrame:
+def _last_n_by_defense(stats: pd.DataFrame, n: int) -> pd.DataFrame:
+    """Keep each defense's most recent n games (by week)."""
+    if not len(stats):
+        return stats
+    wk = stats[["opponent_team", "week"]].drop_duplicates()
+    keep = wk.sort_values("week").groupby("opponent_team").tail(n)
+    return stats.merge(keep, on=["opponent_team", "week"])
+
+
+def defense_allowed(stats: pd.DataFrame, pos: str, last: int | None = None) -> pd.DataFrame:
     """Per-game totals ALLOWED by each defense to one position group.
-    Games = distinct game_ids in which that defense appeared."""
+    Games = distinct game_ids in which that defense appeared.
+    last = only each defense's most recent N games."""
     if not len(stats):
         return pd.DataFrame()
+    if last:
+        stats = _last_n_by_defense(stats, int(last))
     metrics = [m for _, m in _DEF_METRICS[pos]]
     s = stats[stats["position"] == pos]
     games = stats.groupby("opponent_team")["game_id"].nunique().rename("games")
@@ -183,8 +198,8 @@ def defense_allowed(stats: pd.DataFrame, pos: str) -> pd.DataFrame:
     return df
 
 
-def defense_table(pos: str, team: str | None = None) -> tuple[str, str, str] | None:
-    cur = defense_allowed(D.load("stats"), pos)
+def defense_table(pos: str, team: str | None = None, last: int | None = None) -> tuple[str, str, str] | None:
+    cur = defense_allowed(D.load("stats"), pos, last)
     prev = defense_allowed(D.load("stats_prev"), pos)
     if not len(cur):
         return None
@@ -205,7 +220,7 @@ def defense_table(pos: str, team: str | None = None) -> tuple[str, str, str] | N
         if len(prev) and team in prev.index:
             q = prev.loc[team]
             lines.append(f"{D.PREV:<8}" + "".join(f"{_n(q[m], 1):>7}" for m in metrics) + f"{int(q['rank']):>6}{int(q['games']):>4}")
-        return (f"{D.TEAMS.get(team, team)} defense vs {pos} — allowed per game", _code(lines),
+        return (f"{D.TEAMS.get(team, team)} defense vs {pos} — allowed per game{' (last ' + str(last) + ')' if last else ''}", _code(lines),
                 f"rank 1 of 32 = allows the MOST • {D.SEASON} is {int(r['games'])} game(s); read it next to {D.PREV}")
     prev_hdr = f"{D.PREV} rk"
     lines = [f"{'#':<3}{'Team':<5}" + "".join(f"{l:>7}" for l in labels) + f"{prev_hdr:>9}"]
@@ -213,7 +228,7 @@ def defense_table(pos: str, team: str | None = None) -> tuple[str, str, str] | N
         pr = int(prev.loc[t]["rank"]) if len(prev) and t in prev.index else "—"
         lines.append(f"{int(r['rank']):<3}{t:<5}" + "".join(f"{_n(r[m], 1):>7}" for m in metrics) + f"{pr:>9}")
     g = int(cur["games"].min()), int(cur["games"].max())
-    return (f"Defense vs {pos} — allowed per game, {D.SEASON}", _code(lines),
+    return (f"Defense vs {pos} — allowed per game, {'last ' + str(last) if last else D.SEASON}", _code(lines),
             f"1 = allows the most • {g[0]}–{g[1]} games played • last column = where they ranked in {D.PREV}")
 
 
@@ -344,6 +359,7 @@ async def _pick_player(interaction, text: str):
 
 
 DESC = {
+    "last": "Optional: only the last N games (1, 5, 10…)",
     "snaps": "NFL snap share by player, week by week, with trend",
     "snaps.team": "Team (abbr or nickname)",
     "snaps.position": "Optional: QB / RB / WR / TE",
@@ -402,23 +418,23 @@ def setup(bot):
         await interaction.followup.send(embed=_embed(*res) if res else _no_data(f"usage for {hit[1]}"))
 
     @tree.command(name="playerstats", description=DESC["playerstats"])
-    @app_commands.describe(player=DESC["playerstats.player"])
+    @app_commands.describe(player=DESC["playerstats.player"], last=DESC["last"])
     @_guarded
-    async def playerstats_cmd(interaction: discord.Interaction, player: str):
+    async def playerstats_cmd(interaction: discord.Interaction, player: str, last: int | None = None):
         await interaction.response.defer()
         hit = await _pick_player(interaction, player)
         if not hit:
             return
-        res = await asyncio.to_thread(playerstats_table, hit[0])
+        res = await asyncio.to_thread(playerstats_table, hit[0], last)
         await interaction.followup.send(embed=_embed(*res) if res else _no_data(f"stats for {hit[1]}"))
 
     @tree.command(name="defense", description=DESC["defense"])
-    @app_commands.describe(position=DESC["defense.position"], team=DESC["defense.team"])
+    @app_commands.describe(position=DESC["defense.position"], team=DESC["defense.team"], last=DESC["last"])
     @app_commands.choices(position=POS_CHOICES)
     @_guarded
     async def defense_cmd(interaction: discord.Interaction,
                           position: app_commands.Choice[str] | None = None,
-                          team: str | None = None):
+                          team: str | None = None, last: int | None = None):
         await interaction.response.defer()
         pos = position.value if position else "RB"
         t = None
@@ -427,7 +443,7 @@ def setup(bot):
             if not t:
                 await interaction.followup.send(f"Don't know a team called “{team}”.")
                 return
-        res = await asyncio.to_thread(defense_table, pos, t)
+        res = await asyncio.to_thread(defense_table, pos, t, last)
         await interaction.followup.send(embed=_embed(*res) if res else _no_data("defensive splits"))
 
     @tree.command(name="injuries", description=DESC["injuries"])
