@@ -47,15 +47,26 @@ RECENCY = 0.6         # per-game decay for volume: last game 1.0, prior 0.6, 0.3
 K_EFF = 8.0      # games of shrinkage for efficiency
 K_DEF = 6.0      # games of shrinkage for defense-allowed rates
 SHRINK_DEF = 0.5 # how much of a defense's deviation from league avg we apply
-MIN_VOL = {"pass": 10.0, "rush": 3.0, "rec": 2.0}   # per-game volume floor to project
+MIN_VOL = {"pass": 10.0, "rush": 3.0, "rec": 2.0, "recs": 2.0}   # per-game volume floor to project
+# How much to trust LAST season: scaled by games played then (a rookie or an
+# injury year is thin evidence) and halved on a team change (new scheme,
+# new role). This is the Kaleb Johnson fix.
+PRIOR_FULL_GAMES = 8.0
+NEW_TEAM_PRIOR = 0.5
 
 MARKETS = {
-    # market -> (volume col, yards col, position groups it applies to)
+    # market -> (volume col, outcome col, position groups it applies to)
     "pass": ("attempts", "passing_yards", {"QB"}),
     "rush": ("carries", "rushing_yards", {"RB", "QB", "WR"}),
     "rec":  ("targets", "receiving_yards", {"WR", "TE", "RB"}),
+    "recs": ("targets", "receptions", {"WR", "TE", "RB"}),      # efficiency = catch rate
 }
-ODDS_MARKET = {"pass": "player_pass_yds", "rush": "player_rush_yds", "rec": "player_reception_yds"}
+ODDS_MARKET = {"pass": "player_pass_yds", "rush": "player_rush_yds",
+               "rec": "player_reception_yds", "recs": "player_receptions"}
+ODDS_ALT = {"pass": "player_pass_yds_alternate", "rush": "player_rush_yds_alternate",
+            "rec": "player_reception_yds_alternate", "recs": "player_receptions_alternate"}
+ODDS_TD = "player_anytime_td"
+MK_LABEL = {"pass": "Pass Yds", "rush": "Rush Yds", "rec": "Rec Yds", "recs": "Receptions", "td": "Anytime TD"}
 POS_GROUP = {"QB": "QB", "RB": "RB", "FB": "RB", "HB": "RB", "WR": "WR", "TE": "TE"}
 
 
@@ -115,6 +126,8 @@ def _player_rates(df: pd.DataFrame, recency: bool = False) -> pd.DataFrame:
         out[f"{mk}_vol"] = (d[vol] * d["w"]).groupby(d["player_id"]).sum() / wsum
         out[f"{mk}_eff"] = (y / v).where(v > 0)
         out[f"{mk}_n"] = g[vol].apply(lambda s: int((s > 0).sum()))
+    tds = d["rushing_tds"].fillna(0) + d["receiving_tds"].fillna(0)
+    out["td_pg"] = (tds * d["w"]).groupby(d["player_id"]).sum() / wsum
     return out
 
 
@@ -145,19 +158,22 @@ def _defense_rates(df: pd.DataFrame) -> pd.DataFrame:
         sub = d[d["pos"].isin(poss)]
         s = sub.groupby(["opponent_team", "pos"])[yds].sum()
         rows[f"{mk}_allowed"] = s
+    tds = d["rushing_tds"].fillna(0) + d["receiving_tds"].fillna(0)
+    rows["td_allowed"] = tds.groupby([d["opponent_team"], d["pos"]]).sum()
     out = pd.DataFrame(rows).fillna(0.0)
     out["games"] = out.index.get_level_values(0).map(games).values
-    for mk in MARKETS:
+    for mk in list(MARKETS) + ["td"]:
         out[f"{mk}_allowed"] = out[f"{mk}_allowed"] / out["games"]
     return out
 
 
-def _blend(cur, n_cur, prior, k) -> float:
-    """n/(n+K) shrinkage toward the prior; either side may be missing."""
+def _blend(cur, n_cur, prior, k, prior_strength: float = 1.0) -> float:
+    """n/(n+K) shrinkage toward the prior; either side may be missing.
+    prior_strength in (0, 1] scales K down when the prior is thin or stale."""
     cur_ok = cur is not None and not (isinstance(cur, float) and math.isnan(cur))
     pri_ok = prior is not None and not (isinstance(prior, float) and math.isnan(prior))
     if cur_ok and pri_ok:
-        w = n_cur / (n_cur + k)
+        w = n_cur / (n_cur + k * max(0.05, prior_strength))
         return w * float(cur) + (1 - w) * float(prior)
     if cur_ok:
         return float(cur)
@@ -181,11 +197,30 @@ class Projection:
     opp_factor: float
     proj: float
     games_cur: int       # this-season games behind the volume blend
+    opp_rank: int = 0    # 1 = opponent allows the MOST to this position (this season)
 
     def why(self) -> str:
-        vol_lbl = {"pass": "att", "rush": "car", "rec": "tgt"}[self.market]
-        return (f"{self.volume:.1f} {vol_lbl} x {self.efficiency:.2f} yds/{vol_lbl} "
-                f"x {self.opp_factor:.2f} vs {self.opponent} = {self.proj:.1f}")
+        if self.market == "td":
+            return (f"{self.volume:.2f} TD/g x {self.opp_factor:.2f} vs {self.opponent} "
+                    f"= {self.proj:.2f} exp TD")
+        vol_lbl = {"pass": "att", "rush": "car", "rec": "tgt", "recs": "tgt"}[self.market]
+        if self.market == "recs":
+            eff = f"{self.efficiency:.0%} catch"
+        else:
+            eff = f"{self.efficiency:.2f} y/{vol_lbl}"
+        return (f"{self.volume:.1f} {vol_lbl} x {eff} x {self.opp_factor:.2f} "
+                f"vs {self.opponent} = {self.proj:.1f}")
+
+    def matchup(self) -> str:
+        lbl = MK_LABEL.get(self.market, self.market)
+        if not self.opp_rank:
+            return ""
+        what = "TDs" if self.market == "td" else lbl.lower()
+        return f"{self.opponent} allows {_ordinal(self.opp_rank)}-most {what} to {self.pos}s"
+
+
+def _ordinal(n: int) -> str:
+    return f"{n}{'th' if 11 <= n % 100 <= 13 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
 
 
 def project(cur: pd.DataFrame, prior: pd.DataFrame, week: int,
@@ -232,16 +267,22 @@ def project(cur: pd.DataFrame, prior: pd.DataFrame, week: int,
         c = r_cur.loc[pid] if pid in r_cur.index else None
         p = r_pri.loc[pid] if pid in r_pri.index else None
         n_games = int(c["games"]) if c is not None else 0
+        strength = 1.0
+        if p is not None:
+            strength = min(1.0, float(p["games"]) / PRIOR_FULL_GAMES)
+            if c is not None and p["team"] != c["team"]:
+                strength *= NEW_TEAM_PRIOR
         for mk, (_, _, poss) in MARKETS.items():
             if pos not in poss:
                 continue
             vol = _blend(c[f"{mk}_vol"] if c is not None else None, n_games,
-                         p[f"{mk}_vol"] if p is not None else None, K_VOL)
+                         p[f"{mk}_vol"] if p is not None else None, K_VOL, strength)
             if math.isnan(vol) or vol < MIN_VOL[mk]:
                 continue
             n_eff = int(c[f"{mk}_n"]) if c is not None else 0
             eff = _blend(c[f"{mk}_eff"] if c is not None else None, n_eff,
-                         p[f"{mk}_eff"] if p is not None else pos_eff.get((pos, mk)), K_EFF)
+                         p[f"{mk}_eff"] if p is not None else pos_eff.get((pos, mk)), K_EFF,
+                         strength if p is not None else 1.0)
             if math.isnan(eff):
                 eff = pos_eff.get((pos, mk), float("nan"))
             if math.isnan(eff):
@@ -260,8 +301,44 @@ def project(cur: pd.DataFrame, prior: pd.DataFrame, week: int,
             factor = 1.0 + SHRINK_DEF * (r - 1.0) if not math.isnan(r) else 1.0
             factor = min(max(factor, 0.6), 1.5)
             out.append(Projection(pid, row["name"], team, pos, mk, o,
-                                  vol, eff, factor, vol * eff * factor, n_games))
+                                  vol, eff, factor, vol * eff * factor, n_games,
+                                  _rank(d_cur if not d_cur.empty else d_pri, o, pos, mk)))
+        # anytime TD: expected TDs per game (rush + rec), opponent-adjusted; P = 1 - e^-x
+        if pos in ("RB", "WR", "TE", "QB"):
+            td = _blend(c["td_pg"] if c is not None else None, n_games,
+                        p["td_pg"] if p is not None else None, K_EFF, strength)
+            if not math.isnan(td) and td >= 0.05:
+                rc, nc = ratio_generic(d_cur, o, pos, "td")
+                rp, _ = ratio_generic(d_pri, o, pos, "td")
+                r = _blend(rc, nc, rp, K_DEF)
+                factor = 1.0 + SHRINK_DEF * (r - 1.0) if not math.isnan(r) else 1.0
+                factor = min(max(factor, 0.6), 1.5)
+                out.append(Projection(pid, row["name"], team, pos, "td", o, td, 1.0, factor,
+                                      td * factor, n_games,
+                                      _rank(d_cur if not d_cur.empty else d_pri, o, pos, "td")))
     return out
+
+
+def ratio_generic(d: pd.DataFrame, opp: str, pos: str, mk: str) -> tuple[float, int]:
+    if d.empty or (opp, pos) not in d.index:
+        return float("nan"), 0
+    sub = d[d.index.get_level_values(1) == pos]
+    lg = float(sub[f"{mk}_allowed"].mean()) if len(sub) else float("nan")
+    if not lg or math.isnan(lg) or lg <= 0:
+        return float("nan"), 0
+    return float(d.loc[(opp, pos), f"{mk}_allowed"] / lg), int(d.loc[(opp, pos), "games"])
+
+
+def _rank(d: pd.DataFrame, opp: str, pos: str, mk: str) -> int:
+    """1 = allows the most per game to this position, among defenses on file."""
+    if d.empty or (opp, pos) not in d.index:
+        return 0
+    sub = d[d.index.get_level_values(1) == pos][f"{mk}_allowed"].sort_values(ascending=False)
+    return int(list(sub.index.get_level_values(0)).index(opp)) + 1
+
+
+def p_anytime_td(exp_td: float) -> float:
+    return 1.0 - math.exp(-max(exp_td, 0.0))
 
 
 # ------------------------------------------------------------------ probability
@@ -282,6 +359,8 @@ class RatioTable:
         buckets: dict[tuple[str, str], list[float]] = {}
         for wk in weeks:
             for pr in project(cur, prior, wk, schedule, season, snaps):
+                if pr.market == "td":
+                    continue          # TD is Poisson, not a ratio
                 key = (pr.player_id, wk)
                 if key not in actual.index:
                     continue          # didn't play -> prop would be void
