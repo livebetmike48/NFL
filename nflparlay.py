@@ -113,6 +113,14 @@ REVERSE = dict(p=0.50, edge=0.02, min_price=-150, max_pairs=3, adot=11.0, ypr=13
 
 def _conn():
     c = sqlite3.connect(DB)
+    # v1 (Sept 22 afternoon) created nfl_parlay_legs without kind/ticket; a
+    # CREATE IF NOT EXISTS won't upgrade it and every v2 query then fails
+    # ("no such column: kind") -- that was the silent Thursday miss. Park the
+    # old table under a v1 name and build the v2 one.
+    cols = {r[1] for r in c.execute("PRAGMA table_info(nfl_parlay_legs)").fetchall()}
+    if cols and "ticket" not in cols:
+        c.execute("ALTER TABLE nfl_parlay_legs RENAME TO nfl_parlay_legs_v1")
+        log.warning("nflparlay: migrated old nfl_parlay_legs -> nfl_parlay_legs_v1")
     c.execute("""CREATE TABLE IF NOT EXISTS nfl_parlay_legs (
         season INTEGER, week INTEGER, kind TEXT, ticket TEXT, posted_ts INTEGER,
         player_id TEXT, player TEXT, team TEXT, market TEXT, side TEXT, line REAL,
